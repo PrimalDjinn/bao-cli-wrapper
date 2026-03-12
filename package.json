@@ -4,6 +4,7 @@
   },
   "scripts": {
     "api": "pnpm --filter api",
+    "build": "sudo rm -rf ./data ./postgres_data && docker compose down -v && docker compose up --build ",
     "format": "biome check --write"
   }
 }
