@@ -40,9 +40,12 @@ done
 bao auth enable approle 2>/dev/null || true
 
 # Apply Policy
-if [ -f "/bao/env-policy.hcl" ]; then
-    bao policy write env-policy /bao/env-policy.hcl
-fi
+echo "[INIT] Syncing policies..."
+for f in /bao/policy/*.hcl; do
+  [ -e "$f" ] || continue
+  name=$(basename "$f" .hcl)
+  bao policy write "$name" "$f"
+done
 
 # Configure Role
 bao write auth/approle/role/my-app \

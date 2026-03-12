@@ -7,7 +7,8 @@ WORKDIR /bao
 # Copy both potential configs, but we'll use json
 COPY config.json /bao/config.json
 COPY entrypoint.sh /bao/entrypoint.sh
-COPY env-policy.hcl /bao/env-policy.hcl
+RUN mkdir -p /bao/policy
+COPY policy/ /bao/policy/
 
 RUN chmod +x /bao/entrypoint.sh
 
