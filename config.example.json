@@ -1,0 +1,16 @@
+{
+  "disable_mlock": true,
+  "listener": {
+    "tcp": {
+      "address": "0.0.0.0:8200",
+      "tls_disable": "true"
+    }
+  },
+  "storage": {
+    "postgresql": {
+      "connection_url": "postgres://user:password@dbName:port/openbao?sslmode=disable",
+      "table": "bao_kv_store"
+    }
+  },
+  "ui": true
+}

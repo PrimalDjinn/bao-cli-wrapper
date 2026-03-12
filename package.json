@@ -1,0 +1,9 @@
+{
+  "devDependencies": {
+    "@biomejs/biome": "2.4.6"
+  },
+  "scripts": {
+    "api": "pnpm --filter api",
+    "format": "biome check --write"
+  }
+}

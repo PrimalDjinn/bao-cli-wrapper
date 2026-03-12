@@ -1,0 +1,22 @@
+{
+  "author": "",
+  "dependencies": {
+    "node-vault": "^0.10.10"
+  },
+  "description": "",
+  "devDependencies": {
+    "@types/node": "^25.4.0",
+    "dotenv": "^17.3.1",
+    "typescript": "^5.9.3"
+  },
+  "keywords": [],
+  "license": "ISC",
+  "main": "index.js",
+  "name": "api",
+  "scripts": {
+    "format": "biome check --write",
+    "test": "node index.ts"
+  },
+  "type": "module",
+  "version": "1.0.0"
+}
