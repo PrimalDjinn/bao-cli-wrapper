@@ -8,7 +8,7 @@
   },
   "storage": {
     "postgresql": {
-      "connection_url": "postgres://user:password@dbName:port/openbao?sslmode=disable",
+      "connection_url": "postgres://user:password@host:port/dbName?sslmode=disable",
       "table": "bao_kv_store"
     }
   },
