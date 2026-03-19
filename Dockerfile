@@ -1,6 +1,6 @@
 FROM openbao/openbao:latest
 
-RUN apk add --no-cache jq
+RUN apk add --no-cache jq gettext netcat-openbsd curl
 
 WORKDIR /bao
 

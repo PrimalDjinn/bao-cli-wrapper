@@ -2,5 +2,4 @@
 /postgres_data
 *.env
 !*.env.example
-config.json
 **/node_modules/

@@ -1,2 +1,0 @@
-CREATE USER bao WITH PASSWORD 'bao_password';
-GRANT ALL PRIVILEGES ON DATABASE openbao TO bao;

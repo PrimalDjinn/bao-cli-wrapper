@@ -8,15 +8,26 @@ DATA_DIR=${BAO_DATA_DIR:-/bao/data}
 export BAO_ADDR=${BAO_ADDR:-http://127.0.0.1:8200}
 KEYS_FILE="$DATA_DIR/keys.json"
 
+# --- Prepare config ---
+if [ -f /bao/config.json ]; then
+    echo "[INIT] Injecting environment variables into config.json..."
+    envsubst < /bao/config.json > /bao/config.env.json
+    CONFIG_FILE="/bao/config.env.json"
+else
+    echo "[ERROR] /bao/config.json not found!"
+    exit 1
+fi
+
 # 1. Wait for Database
-until nc -z db 5432; do sleep 1; done
+until nc -z db ${POSTGRES_PORT}; do sleep 1; done
 
 # 2. Start OpenBao
-bao server -config=/bao/config.json &
+bao server -config="$CONFIG_FILE" &
 BAO_PID=$!
 
-# 3. Wait for API to respond
-until wget -qS --spider "$BAO_ADDR/v1/sys/health" 2>&1 | grep -q "HTTP/1.1"; do sleep 1; done
+# 3. Wait for API to respond (check valid HTTP status codes for vault states: init, sealed, unsealed)
+echo "[INIT] Waiting for OpenBao API to be ready..."
+until curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$BAO_ADDR/v1/sys/health" | grep -qE "^(200|400|472|501|503)"; do sleep 1; done
 
 # 4. Initialize if needed
 if [ ! -f "$KEYS_FILE" ]; then
