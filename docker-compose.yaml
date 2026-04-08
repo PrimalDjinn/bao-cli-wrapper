@@ -6,7 +6,7 @@ services:
     env_file:
       - .env
     volumes:
-      - ./postgres_data:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql/data
       # This script runs on first boot to ensure the 'bao' user exists
       - ./init-db.sh:/docker-entrypoint-initdb.d/init-db.sh
     healthcheck:
@@ -25,8 +25,13 @@ services:
       db:
         condition: service_healthy
     volumes:
-      - ./data:/bao/data # Still needed for keys.json backup
+      - open_bao_data:${BAO_DATA_DIR:-/bao/data} # Still needed for keys.json backup
     cap_add:
       - IPC_LOCK
     env_file:
       - .env
+
+
+volumes:
+  postgres_data:
+  open_bao_data:
