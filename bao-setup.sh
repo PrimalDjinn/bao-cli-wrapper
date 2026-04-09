@@ -195,11 +195,11 @@ cmd_setup() {
   info "Creating UI placeholders for folder visibility (optional)…"
   
   if [[ "$VISIBILITY" == "1" || "$VISIBILITY" == "3" ]]; then
-    bao kv put "${MOUNT_PATH}/${PATH_PUBLIC}/.bao-init" _created="true" _type="public" &>/dev/null || warn "Failed to create public placeholder."
+    bao kv put "${MOUNT_PATH}/${PATH_PUBLIC}" _created="true" _type="public" &>/dev/null || warn "Failed to create public placeholder."
   fi
   
   if [[ "$VISIBILITY" == "2" || "$VISIBILITY" == "3" ]]; then
-    bao kv put "${MOUNT_PATH}/${PATH_PRIVATE}/.bao-init" _created="true" _type="private" &>/dev/null || warn "Failed to create private placeholder."
+    bao kv put "${MOUNT_PATH}/${PATH_PRIVATE}" _created="true" _type="private" &>/dev/null || warn "Failed to create private placeholder."
   fi
   
   success "UI placeholders created (folders will appear in Web UI)"
