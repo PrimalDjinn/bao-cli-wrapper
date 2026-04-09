@@ -18,5 +18,8 @@
     "tsconfig.json": "tsconfig.*.json, env.d.ts"
   },
   "js/ts.preferences.importModuleSpecifier": "non-relative",
-  "js/ts.updateImportsOnFileMove.enabled": "always"
+  "js/ts.updateImportsOnFileMove.enabled": "always",
+  "[shellscript]": {
+    "editor.defaultFormatter": "mads-hartmann.bash-ide-vscode"
+  }
 }
