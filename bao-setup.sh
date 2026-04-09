@@ -189,21 +189,11 @@ cmd_setup() {
     info "KV v2 secret engine already exists at '${MOUNT_PATH}'."
   fi
 
-  # ── 1.5. Create UI placeholders (so folders appear in Web UI) ──
-  info "Creating UI placeholders to visualize path structure…"
-  if [[ "$VISIBILITY" == "1" || "$VISIBILITY" == "3" ]]; then
-    bao write "${MOUNT_PATH}/data/${PATH_PUBLIC}/.bao-setup" _path="${PATH_PUBLIC}" _type="public" &>/dev/null || warn "Could not create public placeholder (non-critical)"
-    success "Folder '${PATH_PUBLIC}/' now visible in UI"
-  fi
-  if [[ "$VISIBILITY" == "2" || "$VISIBILITY" == "3" ]]; then
-    bao write "${MOUNT_PATH}/data/${PATH_PRIVATE}/.bao-setup" _path="${PATH_PRIVATE}" _type="private" &>/dev/null || warn "Could not create private placeholder (non-critical)"
-    success "Folder '${PATH_PRIVATE}/' now visible in UI"
-  fi
-
   # ── 2. Build & write public policy ──
   local pub_policy_name=""
   if [[ "$VISIBILITY" == "1" || "$VISIBILITY" == "3" ]]; then
-    pub_policy_name="public-${APP_NAME}-${APP_ENV}"
+    # Naming: app-env-type (e.g. heylomeet-production-public)
+    pub_policy_name="${APP_NAME}-${APP_ENV}-public"
     local pub_policy=""
 
     if [[ -n "$PUBLIC_KEYS" ]]; then
@@ -232,9 +222,10 @@ path \"${MOUNT_PATH}/metadata/${PATH_PUBLIC}/*\" {
     echo "$pub_policy" | bao policy write "$pub_policy_name" - \
       && success "Policy '${pub_policy_name}' written."
 
-    # Create dedicated public-reader token (safe & idempotent)
+    # Create named public token (not 'anonymous') for better auditability & management
+    # This token is SAFE TO EXPOSE: read-only, scoped to public paths only
     info "Creating public access token…"
-    local public_token_id="public-reader-${APP_NAME}-${APP_ENV}"
+    local public_token_id="${APP_NAME}-${APP_ENV}-public"
     if bao token lookup "${public_token_id}" &>/dev/null; then
       warn "Token '${public_token_id}' already exists. Skipping."
     else
@@ -252,7 +243,7 @@ path \"${MOUNT_PATH}/metadata/${PATH_PUBLIC}/*\" {
   local role_id="" secret_id="" role_name="${APP_NAME}-${APP_ENV}-backend"
 
   if [[ "$VISIBILITY" == "2" || "$VISIBILITY" == "3" ]]; then
-    priv_policy_name="private-${APP_NAME}-${APP_ENV}"
+    priv_policy_name="${APP_NAME}-${APP_ENV}-private"
     local priv_policy=""
 
     if [[ -n "$PRIVATE_KEYS" ]]; then
@@ -325,7 +316,8 @@ path \"${MOUNT_PATH}/metadata/${PATH_PRIVATE}/*\" {
     echo -e "${G}║${NC}"
     echo -e "${G}║${NC}  ${BOLD}🌐 Public Access${NC}"
     echo -e "${G}║${NC}  Policy      : ${C}${pub_policy_name}${NC}"
-    echo -e "${G}║${NC}  Token       : ${C}public-reader-${APP_NAME}-${APP_ENV}${NC}"
+    echo -e "${G}║${NC}  Token       : ${C}${APP_NAME}-${APP_ENV}-public${NC}"
+    echo -e "${G}║${NC}  ${DIM}💡 This token is SAFE TO EXPOSE: read-only, scoped to public paths${NC}"
     echo -e "${G}║${NC}  Keys        : ${C}${PUBLIC_KEYS:-(wildcard read)}${NC}"
   fi
 
@@ -335,7 +327,7 @@ path \"${MOUNT_PATH}/metadata/${PATH_PRIVATE}/*\" {
     echo -e "${G}║${NC}  Policy      : ${C}${priv_policy_name}${NC}"
     echo -e "${G}║${NC}  AppRole     : ${W}${role_name}${NC}"
     echo -e "${G}║${NC}  BAO_ROLE_ID    : ${Y}${BOLD}${role_id}${NC}"
-    echo -e "${G}║${NC}  BAO_SECRET_ID  : ${Y}${BOLD}${secret_id}${NC}  ${R}← save securely!${NC}"
+    echo -e "${G}║${NC}  BAO_SECRET_ID  : ${Y}${BOLD}${secret_id}${NC}  ${R}← NEVER expose these!${NC}"
     echo -e "${G}║${NC}  Keys        : ${R}${PRIVATE_KEYS:-(wildcard read)}${NC}"
   fi
 
@@ -352,7 +344,9 @@ path \"${MOUNT_PATH}/metadata/${PATH_PRIVATE}/*\" {
 
   if [[ "$VISIBILITY" == "1" || "$VISIBILITY" == "3" ]]; then
     info "Test public access:"
-    echo -e "  ${DIM}curl -s -H 'X-Vault-Token: public-reader-${APP_NAME}-${APP_ENV}' \\"
+    echo -e "  ${DIM}# This token is safe to commit to git / use in frontend${NC}"
+    echo -e "  ${DIM}export BAO_TOKEN=${APP_NAME}-${APP_ENV}-public${NC}"
+    echo -e "  ${DIM}curl -s -H \"X-Vault-Token: \${BAO_TOKEN}\" \\"
     echo -e "    \${BAO_ADDR}/v1/${MOUNT_PATH}/data/${PATH_PUBLIC}/api-key | jq${NC}"
     echo ""
   fi
