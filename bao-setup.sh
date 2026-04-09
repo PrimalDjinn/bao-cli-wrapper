@@ -189,6 +189,17 @@ cmd_setup() {
     info "KV v2 secret engine already exists at '${MOUNT_PATH}'."
   fi
 
+    # ── 1.5. Create UI placeholders (so folders appear in Web UI) ──
+  info "Creating UI placeholders to visualize path structure…"
+  if [[ "$VISIBILITY" == "1" || "$VISIBILITY" == "3" ]]; then
+    bao write "${MOUNT_PATH}/data/${PATH_PUBLIC}/.bao-setup" _path="${PATH_PUBLIC}" _type="public" &>/dev/null || warn "Could not create public placeholder (non-critical)"
+    success "Folder '${PATH_PUBLIC}/' now visible in UI"
+  fi
+  if [[ "$VISIBILITY" == "2" || "$VISIBILITY" == "3" ]]; then
+    bao write "${MOUNT_PATH}/data/${PATH_PRIVATE}/.bao-setup" _path="${PATH_PRIVATE}" _type="private" &>/dev/null || warn "Could not create private placeholder (non-critical)"
+    success "Folder '${PATH_PRIVATE}/' now visible in UI"
+  fi
+
   # ── 2. Build & write public policy ──
   local pub_policy_name=""
   if [[ "$VISIBILITY" == "1" || "$VISIBILITY" == "3" ]]; then
