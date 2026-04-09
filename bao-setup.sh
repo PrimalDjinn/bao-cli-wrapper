@@ -189,16 +189,20 @@ cmd_setup() {
     info "KV v2 secret engine already exists at '${MOUNT_PATH}'."
   fi
 
-    # ── 1.5. Create UI placeholders (so folders appear in Web UI) ──
-  info "Creating UI placeholders to visualize path structure…"
+  # ── 1.5. Create UI placeholders (optional, uses admin token) ──
+  # This writes tiny dummy secrets so folders appear in Web UI immediately
+  # Safe to skip — folders will appear after first real secret write anyway
+  info "Creating UI placeholders for folder visibility (optional)…"
+  
   if [[ "$VISIBILITY" == "1" || "$VISIBILITY" == "3" ]]; then
-    bao write "${MOUNT_PATH}/data/${PATH_PUBLIC}/.bao-setup" _path="${PATH_PUBLIC}" _type="public" &>/dev/null || warn "Could not create public placeholder (non-critical)"
-    success "Folder '${PATH_PUBLIC}/' now visible in UI"
+    bao kv put "${MOUNT_PATH}/${PATH_PUBLIC}/.bao-init" _created="true" _type="public" &>/dev/null || warn "Failed to create public placeholder."
   fi
+  
   if [[ "$VISIBILITY" == "2" || "$VISIBILITY" == "3" ]]; then
-    bao write "${MOUNT_PATH}/data/${PATH_PRIVATE}/.bao-setup" _path="${PATH_PRIVATE}" _type="private" &>/dev/null || warn "Could not create private placeholder (non-critical)"
-    success "Folder '${PATH_PRIVATE}/' now visible in UI"
+    bao kv put "${MOUNT_PATH}/${PATH_PRIVATE}/.bao-init" _created="true" _type="private" &>/dev/null || warn "Failed to create private placeholder."
   fi
+  
+  success "UI placeholders created (folders will appear in Web UI)"
 
   # ── 2. Build & write public policy ──
   local pub_policy_name=""
