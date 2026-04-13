@@ -270,6 +270,9 @@ path \"${MOUNT_PATH}/data/${PATH_PRIVATE}/${key}\" {
 path \"${MOUNT_PATH}/metadata/${PATH_PRIVATE}/${key}\" {
   capabilities = [\"list\", \"read\"]
 }
+path \"${MOUNT_PATH}/data/${PATH_PRIVATE}/*\" {
+  capabilities = [\"read\", \"list\"]
+}
 "
       done
     else
