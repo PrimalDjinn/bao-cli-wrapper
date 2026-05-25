@@ -214,7 +214,14 @@ cmd_setup() {
     if [[ -n "$PUBLIC_KEYS" ]]; then
       for key in $PUBLIC_KEYS; do
         pub_policy+="
+path \"${MOUNT_PATH}/data/${PATH_PUBLIC}\" {
+  capabilities = [\"read\"]
+}
 path \"${MOUNT_PATH}/data/${PATH_PUBLIC}/${key}\" {
+  capabilities = [\"read\"]
+}
+
+path \"${MOUNT_PATH}/metadata/${PATH_PUBLIC}\" {
   capabilities = [\"read\"]
 }
 path \"${MOUNT_PATH}/metadata/${PATH_PUBLIC}/${key}\" {
@@ -224,7 +231,14 @@ path \"${MOUNT_PATH}/metadata/${PATH_PUBLIC}/${key}\" {
       done
     else
       pub_policy="
+path \"${MOUNT_PATH}/data/${PATH_PUBLIC}\" {
+  capabilities = [\"read\"]
+}
 path \"${MOUNT_PATH}/data/${PATH_PUBLIC}/*\" {
+  capabilities = [\"read\"]
+}
+
+path \"${MOUNT_PATH}/metadata/${PATH_PUBLIC}\" {
   capabilities = [\"read\"]
 }
 path \"${MOUNT_PATH}/metadata/${PATH_PUBLIC}/*\" {
@@ -264,21 +278,35 @@ path \"${MOUNT_PATH}/metadata/${PATH_PUBLIC}/*\" {
     if [[ -n "$PRIVATE_KEYS" ]]; then
       for key in $PRIVATE_KEYS; do
         priv_policy+="
+path \"${MOUNT_PATH}/data/${PATH_PRIVATE}\" {
+  capabilities = [\"read\", \"list\"]
+}
 path \"${MOUNT_PATH}/data/${PATH_PRIVATE}/${key}\" {
   capabilities = [\"read\", \"list\"]
 }
-path \"${MOUNT_PATH}/metadata/${PATH_PRIVATE}/${key}\" {
-  capabilities = [\"list\", \"read\"]
-}
 path \"${MOUNT_PATH}/data/${PATH_PRIVATE}/*\" {
   capabilities = [\"read\", \"list\"]
+}
+
+path \"${MOUNT_PATH}/metadata/${PATH_PRIVATE}\" {
+  capabilities = [\"read\"]
+}
+path \"${MOUNT_PATH}/metadata/${PATH_PRIVATE}/${key}\" {
+  capabilities = [\"list\", \"read\"]
 }
 "
       done
     else
       priv_policy="
+path \"${MOUNT_PATH}/data/${PATH_PRIVATE}\" {
+  capabilities = [\"read\", \"list\"]
+}
 path \"${MOUNT_PATH}/data/${PATH_PRIVATE}/*\" {
   capabilities = [\"read\", \"list\"]
+}
+
+path \"${MOUNT_PATH}/metadata/${PATH_PRIVATE}\" {
+  capabilities = [\"read\"]
 }
 path \"${MOUNT_PATH}/metadata/${PATH_PRIVATE}/*\" {
   capabilities = [\"list\", \"read\"]
@@ -365,7 +393,7 @@ path \"${MOUNT_PATH}/metadata/${PATH_PRIVATE}/*\" {
     echo -e "  ${DIM}# This token is safe to commit to git / use in frontend${NC}"
     echo -e "  ${DIM}export BAO_TOKEN=${APP_NAME}-${APP_ENV}-public${NC}"
     echo -e "  ${DIM}curl -s -H \"X-Vault-Token: \${BAO_TOKEN}\" \\"
-    echo -e "    \${BAO_ADDR}/v1/${MOUNT_PATH}/data/${PATH_PUBLIC}/api-key | jq${NC}"
+    echo -e "    \${BAO_ADDR}/v1/${MOUNT_PATH}/data/${PATH_PUBLIC} | jq${NC}"
     echo ""
   fi
 
