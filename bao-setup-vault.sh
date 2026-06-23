@@ -52,13 +52,12 @@ show_help() {
   echo ""
   echo -e "  ${W}${BOLD}COMMANDS${NC}"
   divider
-  echo -e "  ${Y}setup${NC}          Interactive TUI to configure an app's ACL & policies"
-  echo -e "  ${Y}add-app${NC}        Quickly add a new app (alias for setup)"
-  echo -e "  ${Y}list${NC}           List all bao-setup managed policies"
-  echo -e "  ${Y}token${NC}          Generate or retrieve a token for a private app"
-  echo -e "  ${Y}renew-public-token${NC} Revoke and recreate a public token"
-  echo -e "  ${Y}revoke${NC}         Revoke a token by accessor or token ID"
-  echo -e "  ${Y}help${NC}           Show this message"
+  echo -e "  ${Y}setup${NC}               Interactive TUI to configure an app's ACL & policies"
+  echo -e "  ${Y}add-app${NC}             Quickly add a new app (alias for setup)"
+  echo -e "  ${Y}list${NC}                List all bao-setup managed policies"
+  echo -e "  ${Y}renew-public-token${NC}  Revoke and recreate a public token"
+  echo -e "  ${Y}revoke${NC}              Revoke a token by accessor or token ID"
+  echo -e "  ${Y}help${NC}                Show this message"
   divider
   echo ""
   echo -e "  ${W}${BOLD}EXAMPLES${NC}"
@@ -68,56 +67,17 @@ show_help() {
   echo -e "  ${DIM}# List all managed policies${NC}"
   echo -e "  ${C}./bao-setup.sh list${NC}"
   echo ""
+  echo -e "  ${DIM}# Revoke and recreate a public token${NC}"
+  echo -e "  ${C}./bao-setup.sh renew-public-token${NC}"
+  echo -e "  ${C}./bao-setup.sh renew-public-token heylomeet production${NC}"
+  echo ""
   echo -e "  ${W}${BOLD}ENVIRONMENT${NC}"
   echo -e "  ${Y}BAO_ADDR${NC}       OpenBao server address  (e.g. https://bao.example.com:8200)"
   echo -e "  ${Y}BAO_TOKEN${NC}      Root / admin token for management operations"
   echo ""
-  echo -e "  ${W}${BOLD}PUBLIC TOKEN RENEWAL${NC}"
-  echo -e "  ${C}./bao-setup.sh renew-public-token${NC}"
-  echo -e "  ${C}./bao-setup.sh renew-public-token heylomeet production${NC}"
-  echo ""
 }
 
-# ─── LIST ─────────────────────────────────────────────────
-cmd_list() {
-  banner; echo ""
-  label "  Managed Policies (bao-setup)"
-  divider
-  local policies
-  policies=$(bao policies list 2>/dev/null || bao policy list 2>/dev/null)
-  if [[ -z "$policies" ]]; then
-    warn "No policies found."
-    return
-  fi
-
-  local found=0
-  while IFS= read -r p; do
-    [[ "$p" =~ ^(public|private)- ]] || { echo -e "  ${DIM}$p${NC}"; continue; }
-    echo -e "  ${C}$p${NC}"
-    found=$((found+1))
-  done <<< "$policies"
-
-  echo ""; info "Total: $(echo "$policies" | wc -l | tr -d ' ') policies on server"
-  divider
-}
-
-# ─── REVOKE ───────────────────────────────────────────────
-cmd_revoke() {
-  banner; echo ""
-  label "  Revoke Token"
-  divider
-  echo -e "  ${C}1)${NC} Revoke by token ID"
-  echo -e "  ${C}2)${NC} Revoke by accessor"
-  ask "Choice [1/2]:" REVOKE_CHOICE
-  case "$REVOKE_CHOICE" in
-    1) ask_secret "Token ID:" TOKEN_ID; bao token revoke "$TOKEN_ID" && success "Token revoked." ;;
-    2) ask "Accessor ID:" ACCESSOR_ID; bao token revoke -accessor "$ACCESSOR_ID" && success "Token revoked by accessor." ;;
-    *) error "Invalid choice."; exit 1 ;;
-  esac
-}
-
-
-# ─── PUBLIC TOKEN RENEWAL ───────────────────────────────────
+# ─── PUBLIC TOKEN HELPERS ────────────────────────────────
 public_token_id_for() {
   local app_name="$1"
   local app_env="$2"
@@ -135,6 +95,7 @@ create_public_token() {
   local app_env="$2"
   local policy_name="$3"
   local force_recreate="${4:-false}"
+
   local token_id
   token_id="$(public_token_id_for "${app_name}" "${app_env}")"
 
@@ -150,7 +111,8 @@ create_public_token() {
         && success "Existing public token revoked." \
         || warn "Could not revoke '${token_id}' directly. It may already be expired or revoked."
     else
-      warn "Token '${token_id}' already exists. Skipping. Use renew-public-token to recreate it."
+      warn "Token '${token_id}' already exists. Skipping."
+      warn "Run: ${0} renew-public-token ${app_name} ${app_env}"
       return 0
     fi
   fi
@@ -170,6 +132,59 @@ create_public_token() {
   fi
 }
 
+# ─── LIST ─────────────────────────────────────────────────
+cmd_list() {
+  banner; echo ""
+  label "  Managed Policies (bao-setup)"
+  divider
+
+  local policies
+  policies=$(bao policies list 2>/dev/null || bao policy list 2>/dev/null)
+
+  if [[ -z "$policies" ]]; then
+    warn "No policies found."
+    return
+  fi
+
+  local found=0
+  while IFS= read -r p; do
+    [[ "$p" =~ ^(public|private)- ]] || { echo -e "  ${DIM}$p${NC}"; continue; }
+    echo -e "  ${C}$p${NC}"
+    found=$((found+1))
+  done <<< "$policies"
+
+  echo ""
+  info "Total: $(echo "$policies" | wc -l | tr -d ' ') policies on server"
+  divider
+}
+
+# ─── REVOKE ───────────────────────────────────────────────
+cmd_revoke() {
+  banner; echo ""
+  label "  Revoke Token"
+  divider
+
+  echo -e "  ${C}1)${NC} Revoke by token ID"
+  echo -e "  ${C}2)${NC} Revoke by accessor"
+  ask "Choice [1/2]:" REVOKE_CHOICE
+
+  case "$REVOKE_CHOICE" in
+    1)
+      ask_secret "Token ID:" TOKEN_ID
+      bao token revoke "$TOKEN_ID" && success "Token revoked."
+      ;;
+    2)
+      ask "Accessor ID:" ACCESSOR_ID
+      bao token revoke -accessor "$ACCESSOR_ID" && success "Token revoked by accessor."
+      ;;
+    *)
+      error "Invalid choice."
+      exit 1
+      ;;
+  esac
+}
+
+# ─── RENEW PUBLIC TOKEN ───────────────────────────────────
 cmd_renew_public_token() {
   banner; echo ""
   label "  Renew Public Token"
@@ -192,6 +207,7 @@ cmd_renew_public_token() {
   echo -e "  Policy      : ${C}${policy_name}${NC}"
   echo -e "  Token       : ${C}${token_id}${NC}"
   divider
+
   confirm "Revoke and recreate this public token?" || { warn "Aborted."; exit 0; }
 
   echo ""
@@ -234,10 +250,22 @@ cmd_setup() {
   info "💡 Leave empty for wildcard access within the path — configure exact keys later via Web UI"
 
   case "$VISIBILITY" in
-    1) ask "Public keys:" PUBLIC_KEYS; PRIVATE_KEYS="" ;;
-    2) PUBLIC_KEYS=""; ask "Private keys:" PRIVATE_KEYS ;;
-    3) ask "Public keys:" PUBLIC_KEYS; ask "Private keys:" PRIVATE_KEYS ;;
-    *) error "Invalid choice."; exit 1 ;;
+    1)
+      ask "Public keys:" PUBLIC_KEYS
+      PRIVATE_KEYS=""
+      ;;
+    2)
+      PUBLIC_KEYS=""
+      ask "Private keys:" PRIVATE_KEYS
+      ;;
+    3)
+      ask "Public keys:" PUBLIC_KEYS
+      ask "Private keys:" PRIVATE_KEYS
+      ;;
+    *)
+      error "Invalid choice."
+      exit 1
+      ;;
   esac
 
   ask "AppRole TTL for private access (e.g. 8760h, 0=infinite) [8760h]:" TOKEN_TTL_INPUT
@@ -255,17 +283,27 @@ cmd_setup() {
   echo -e "  App         : ${W}${APP_NAME}${NC}"
   echo -e "  Environment : ${W}${APP_ENV}${NC}"
   echo -e "  Mount       : ${W}${MOUNT_PATH}${NC}"
+
   case "$VISIBILITY" in
-    1) echo -e "  Path        : ${W}${PATH_PUBLIC}${NC} ${DIM}(public)${NC}" ;;
-    2) echo -e "  Path        : ${W}${PATH_PRIVATE}${NC} ${DIM}(private)${NC}" ;;
-    3) echo -e "  Paths       : ${W}${PATH_PUBLIC}${NC} ${DIM}(public)${NC}"
-       echo -e "                ${W}${PATH_PRIVATE}${NC} ${DIM}(private)${NC}" ;;
+    1)
+      echo -e "  Path        : ${W}${PATH_PUBLIC}${NC} ${DIM}(public)${NC}"
+      ;;
+    2)
+      echo -e "  Path        : ${W}${PATH_PRIVATE}${NC} ${DIM}(private)${NC}"
+      ;;
+    3)
+      echo -e "  Paths       : ${W}${PATH_PUBLIC}${NC} ${DIM}(public)${NC}"
+      echo -e "                ${W}${PATH_PRIVATE}${NC} ${DIM}(private)${NC}"
+      ;;
   esac
+
   echo -e "  ${DIM}Full path example: /v1/${MOUNT_PATH}/data/${PATH_PUBLIC}/api-key${NC}"
+
   [[ -n "$PUBLIC_KEYS"  ]] && echo -e "  Public keys : ${G}${PUBLIC_KEYS}${NC}"
   [[ -n "$PRIVATE_KEYS" ]] && echo -e "  Private keys: ${R}${PRIVATE_KEYS}${NC}"
   [[ -z "$PUBLIC_KEYS" && "$VISIBILITY" != "2" ]] && echo -e "  Public keys : ${Y}(wildcard — add exact keys via UI later)${NC}"
   [[ -z "$PRIVATE_KEYS" && "$VISIBILITY" != "1" ]] && echo -e "  Private keys: ${Y}(wildcard — add exact keys via UI later)${NC}"
+
   divider
   confirm "Apply this configuration?" || { warn "Aborted."; exit 0; }
 
@@ -276,28 +314,32 @@ cmd_setup() {
   # ── 1. Enable KV v2 mount (once per app) ──
   if ! bao secrets list -format=json 2>/dev/null | grep -q "\"${MOUNT_PATH}/\""; then
     info "Enabling KV v2 secret engine at '${MOUNT_PATH}'…"
-    bao secrets enable -path="${MOUNT_PATH}" kv-v2 && success "KV v2 enabled at '${MOUNT_PATH}'."
+    bao secrets enable -path="${MOUNT_PATH}" kv-v2 \
+      && success "KV v2 enabled at '${MOUNT_PATH}'."
   else
     info "KV v2 secret engine already exists at '${MOUNT_PATH}'."
   fi
 
   # ── 1.5. Create UI placeholders (optional, uses admin token) ──
-  # This writes tiny dummy secrets so folders appear in Web UI immediately
-  # Safe to skip — folders will appear after first real secret write anyway
+  # This writes tiny dummy secrets so folders appear in Web UI immediately.
+  # Safe to skip — folders will appear after first real secret write anyway.
   info "Creating UI placeholders for folder visibility (optional)…"
-  
+
   if [[ "$VISIBILITY" == "1" || "$VISIBILITY" == "3" ]]; then
-    bao kv put "${MOUNT_PATH}/${PATH_PUBLIC}" _created="true" _type="public" &>/dev/null || warn "Failed to create public placeholder."
+    bao kv put "${MOUNT_PATH}/${PATH_PUBLIC}" _created="true" _type="public" &>/dev/null \
+      || warn "Failed to create public placeholder."
   fi
-  
+
   if [[ "$VISIBILITY" == "2" || "$VISIBILITY" == "3" ]]; then
-    bao kv put "${MOUNT_PATH}/${PATH_PRIVATE}" _created="true" _type="private" &>/dev/null || warn "Failed to create private placeholder."
+    bao kv put "${MOUNT_PATH}/${PATH_PRIVATE}" _created="true" _type="private" &>/dev/null \
+      || warn "Failed to create private placeholder."
   fi
-  
+
   success "UI placeholders created (folders will appear in Web UI)"
 
   # ── 2. Build & write public policy ──
   local pub_policy_name=""
+
   if [[ "$VISIBILITY" == "1" || "$VISIBILITY" == "3" ]]; then
     # Naming: app-env-type (e.g. heylomeet-production-public)
     pub_policy_name="${APP_NAME}-${APP_ENV}-public"
@@ -343,20 +385,10 @@ path \"${MOUNT_PATH}/metadata/${PATH_PUBLIC}/*\" {
     echo "$pub_policy" | bao policy write "$pub_policy_name" - \
       && success "Policy '${pub_policy_name}' written."
 
-    # Create named public token (not 'anonymous') for better auditability & management
-    # This token is SAFE TO EXPOSE: read-only, scoped to public paths only
-    info "Creating public access token…"
-    local public_token_id="${APP_NAME}-${APP_ENV}-public"
-    if bao token lookup "${public_token_id}" &>/dev/null; then
-      warn "Token '${public_token_id}' already exists. Skipping."
-    else
-      if bao token create -id="${public_token_id}" -policy="${pub_policy_name}" \
-        -no-default-policy -renewable=false -ttl=0 &>/dev/null; then
-        success "Public access token created: ${public_token_id}"
-      else
-        warn "Failed to create public token. Check admin permissions."
-      fi
-    fi
+    # Create named public token (not 'anonymous') for better auditability & management.
+    # This token is SAFE TO EXPOSE: read-only, scoped to public paths only.
+    # Important: created as an orphan so it is not revoked with the admin token that created it.
+    create_public_token "${APP_NAME}" "${APP_ENV}" "${pub_policy_name}"
   fi
 
   # ── 3. Build & write private policy + AppRole ──
@@ -418,16 +450,18 @@ path \"${MOUNT_PATH}/metadata/${PATH_PRIVATE}/*\" {
 
     # Configure AppRole
     info "Configuring AppRole: ${role_name}…"
+
     local ttl_flag=""
     [[ "$TOKEN_TTL" != "0" ]] && ttl_flag="token_ttl=${TOKEN_TTL}"
-    
+
     bao write auth/approle/role/"${role_name}" \
       token_policies="${priv_policy_name}" \
       token_no_default_policy=true \
       token_renewable=true \
       ${ttl_flag} \
       secret_id_num_uses=0 \
-      secret_id_ttl=0 &>/dev/null && success "AppRole '${role_name}' configured."
+      secret_id_ttl=0 &>/dev/null \
+      && success "AppRole '${role_name}' configured."
 
     # Fetch credentials
     role_id=$(bao read -field=role_id auth/approle/role/"${role_name}/role-id" 2>/dev/null)
@@ -445,9 +479,15 @@ path \"${MOUNT_PATH}/metadata/${PATH_PRIVATE}/*\" {
   echo -e "${G}║${NC}  Mount       : ${W}${MOUNT_PATH}${NC}"
 
   case "$VISIBILITY" in
-    1) echo -e "${G}║${NC}  ${DIM}📁 Path in UI: ${MOUNT_PATH} → ${PATH_PUBLIC}${NC}" ;;
-    2) echo -e "${G}║${NC}  ${DIM}📁 Path in UI: ${MOUNT_PATH} → ${PATH_PRIVATE}${NC}" ;;
-    3) echo -e "${G}║${NC}  ${DIM}📁 Paths in UI: ${MOUNT_PATH} → ${PATH_PUBLIC} + ${PATH_PRIVATE}${NC}" ;;
+    1)
+      echo -e "${G}║${NC}  ${DIM}📁 Path in UI: ${MOUNT_PATH} → ${PATH_PUBLIC}${NC}"
+      ;;
+    2)
+      echo -e "${G}║${NC}  ${DIM}📁 Path in UI: ${MOUNT_PATH} → ${PATH_PRIVATE}${NC}"
+      ;;
+    3)
+      echo -e "${G}║${NC}  ${DIM}📁 Paths in UI: ${MOUNT_PATH} → ${PATH_PUBLIC} + ${PATH_PRIVATE}${NC}"
+      ;;
   esac
 
   if [[ "$VISIBILITY" == "1" || "$VISIBILITY" == "3" ]]; then
@@ -493,7 +533,8 @@ path \"${MOUNT_PATH}/metadata/${PATH_PRIVATE}/*\" {
   if [[ -z "$PUBLIC_KEYS" && -z "$PRIVATE_KEYS" ]]; then
     local BAO_SERVER="${BAO_ADDR:-${VAULT_ADDR:-http://127.0.0.1:8200}}"
     local policy_refs=""
-    [[ -n "$pub_policy_name" ]] && policy_refs+="${pub_policy_name} "
+
+    [[ -n "$pub_policy_name"  ]] && policy_refs+="${pub_policy_name} "
     [[ -n "$priv_policy_name" ]] && policy_refs+="${priv_policy_name}"
 
     echo ""
@@ -502,6 +543,7 @@ path \"${MOUNT_PATH}/metadata/${PATH_PRIVATE}/*\" {
     echo -e "${Y}╠══════════════════════════════════════════════════════════╣${NC}"
     echo -e "${Y}║${NC}  1. Open: ${C}${BAO_SERVER}${NC}"
     echo -e "${Y}║${NC}  2. Go to: ${W}Policies → ${policy_refs}${NC}"
+
     case "$VISIBILITY" in
       1)
         echo -e "${Y}║${NC}  3. Replace wildcard with exact keys under ${PATH_PUBLIC}:"
@@ -519,6 +561,7 @@ path \"${MOUNT_PATH}/metadata/${PATH_PRIVATE}/*\" {
         echo -e "${Y}║${NC}     ${DIM}path \"${MOUNT_PATH}/data/${PATH_PRIVATE}/db-password\" { capabilities = [\"read\"] }${NC}"
         ;;
     esac
+
     echo -e "${Y}║${NC}  4. Save & your app is production-ready!"
     echo -e "${Y}╚══════════════════════════════════════════════════════════╝${NC}"
     echo ""
@@ -532,11 +575,21 @@ CMD="${1:-help}"
 shift || true
 
 case "$CMD" in
-  setup|add-app)       cmd_setup  ;;
-  list)                cmd_list   ;;
-  renew-public-token)  cmd_renew_public_token "$@" ;;
-  revoke)              cmd_revoke ;;
-  help|--help|-h) show_help  ;;
+  setup|add-app)
+    cmd_setup
+    ;;
+  list)
+    cmd_list
+    ;;
+  renew-public-token)
+    cmd_renew_public_token "$@"
+    ;;
+  revoke)
+    cmd_revoke
+    ;;
+  help|--help|-h)
+    show_help
+    ;;
   *)
     error "Unknown command: ${CMD}"
     echo ""
