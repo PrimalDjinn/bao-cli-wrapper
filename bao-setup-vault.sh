@@ -56,6 +56,7 @@ show_help() {
   echo -e "  ${Y}add-app${NC}        Quickly add a new app (alias for setup)"
   echo -e "  ${Y}list${NC}           List all bao-setup managed policies"
   echo -e "  ${Y}token${NC}          Generate or retrieve a token for a private app"
+  echo -e "  ${Y}renew-public-token${NC} Revoke and recreate a public token"
   echo -e "  ${Y}revoke${NC}         Revoke a token by accessor or token ID"
   echo -e "  ${Y}help${NC}           Show this message"
   divider
@@ -70,6 +71,10 @@ show_help() {
   echo -e "  ${W}${BOLD}ENVIRONMENT${NC}"
   echo -e "  ${Y}BAO_ADDR${NC}       OpenBao server address  (e.g. https://bao.example.com:8200)"
   echo -e "  ${Y}BAO_TOKEN${NC}      Root / admin token for management operations"
+  echo ""
+  echo -e "  ${W}${BOLD}PUBLIC TOKEN RENEWAL${NC}"
+  echo -e "  ${C}./bao-setup.sh renew-public-token${NC}"
+  echo -e "  ${C}./bao-setup.sh renew-public-token heylomeet production${NC}"
   echo ""
 }
 
@@ -109,6 +114,93 @@ cmd_revoke() {
     2) ask "Accessor ID:" ACCESSOR_ID; bao token revoke -accessor "$ACCESSOR_ID" && success "Token revoked by accessor." ;;
     *) error "Invalid choice."; exit 1 ;;
   esac
+}
+
+
+# ─── PUBLIC TOKEN RENEWAL ───────────────────────────────────
+public_token_id_for() {
+  local app_name="$1"
+  local app_env="$2"
+  echo "${app_name}-${app_env}-public"
+}
+
+public_policy_name_for() {
+  local app_name="$1"
+  local app_env="$2"
+  echo "${app_name}-${app_env}-public"
+}
+
+create_public_token() {
+  local app_name="$1"
+  local app_env="$2"
+  local policy_name="$3"
+  local force_recreate="${4:-false}"
+  local token_id
+  token_id="$(public_token_id_for "${app_name}" "${app_env}")"
+
+  if ! bao policy read "${policy_name}" &>/dev/null; then
+    error "Policy '${policy_name}' does not exist. Run setup first or create the policy."
+    return 1
+  fi
+
+  if bao token lookup "${token_id}" &>/dev/null; then
+    if [[ "${force_recreate}" == "true" ]]; then
+      info "Revoking existing public token: ${token_id}…"
+      bao token revoke "${token_id}" &>/dev/null \
+        && success "Existing public token revoked." \
+        || warn "Could not revoke '${token_id}' directly. It may already be expired or revoked."
+    else
+      warn "Token '${token_id}' already exists. Skipping. Use renew-public-token to recreate it."
+      return 0
+    fi
+  fi
+
+  info "Creating public access token: ${token_id}…"
+  if bao token create \
+    -id="${token_id}" \
+    -policy="${policy_name}" \
+    -no-default-policy \
+    -orphan \
+    -renewable=false \
+    &>/dev/null; then
+    success "Public access token created: ${token_id}"
+  else
+    error "Failed to create public token. Check admin permissions and token ID uniqueness."
+    return 1
+  fi
+}
+
+cmd_renew_public_token() {
+  banner; echo ""
+  label "  Renew Public Token"
+  divider
+
+  local APP_NAME="${1:-}"
+  local APP_ENV="${2:-}"
+
+  [[ -z "${APP_NAME}" ]] && ask "App name       (e.g. heylomeet):" APP_NAME
+  [[ -z "${APP_ENV}"  ]] && ask "Environment    (e.g. production):" APP_ENV
+
+  local token_id policy_name
+  token_id="$(public_token_id_for "${APP_NAME}" "${APP_ENV}")"
+  policy_name="$(public_policy_name_for "${APP_NAME}" "${APP_ENV}")"
+
+  echo ""
+  label "  Preview"
+  echo -e "  App         : ${W}${APP_NAME}${NC}"
+  echo -e "  Environment : ${W}${APP_ENV}${NC}"
+  echo -e "  Policy      : ${C}${policy_name}${NC}"
+  echo -e "  Token       : ${C}${token_id}${NC}"
+  divider
+  confirm "Revoke and recreate this public token?" || { warn "Aborted."; exit 0; }
+
+  echo ""
+  create_public_token "${APP_NAME}" "${APP_ENV}" "${policy_name}" true
+
+  echo ""
+  info "Test public access:"
+  echo -e "  ${DIM}export BAO_TOKEN=${token_id}${NC}"
+  echo -e "  ${DIM}bao token lookup \"\${BAO_TOKEN}\"${NC}"
 }
 
 # ─── SETUP ─────────────────────────────────────────────────
@@ -440,9 +532,10 @@ CMD="${1:-help}"
 shift || true
 
 case "$CMD" in
-  setup|add-app)  cmd_setup  ;;
-  list)           cmd_list   ;;
-  revoke)         cmd_revoke ;;
+  setup|add-app)       cmd_setup  ;;
+  list)                cmd_list   ;;
+  renew-public-token)  cmd_renew_public_token "$@" ;;
+  revoke)              cmd_revoke ;;
   help|--help|-h) show_help  ;;
   *)
     error "Unknown command: ${CMD}"
