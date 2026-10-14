@@ -38,6 +38,42 @@ require_bao() {
   fi
 }
 
+# The bao client waits 60 seconds per attempt and retries 5xx responses twice, so a hung
+# server holds a command for minutes, and a retried write whose first attempt succeeded
+# reports a misleading failure. The Worker in front of OpenBao answers 504 after 30 seconds,
+# so 40 seconds is enough. Retries are off because operators can re-run a command.
+# Anything already set, including the VAULT_* spellings, is left alone.
+configure_client() {
+  if [[ -z "${BAO_CLIENT_TIMEOUT+x}" && -z "${VAULT_CLIENT_TIMEOUT+x}" ]]; then
+    export BAO_CLIENT_TIMEOUT=40
+  fi
+  if [[ -z "${BAO_MAX_RETRIES+x}" && -z "${VAULT_MAX_RETRIES+x}" ]]; then
+    export BAO_MAX_RETRIES=0
+  fi
+}
+
+# Fail before an interactive session rather than after the last question. `bao status`
+# exits 0 when unsealed, 2 when sealed and 1 when it cannot get an answer.
+require_server() {
+  if [[ "${BAO_SETUP_SKIP_PREFLIGHT:-}" == "1" ]]; then
+    return 0
+  fi
+  local rc=0
+  bao status &>/dev/null || rc=$?
+  case "${rc}" in
+    0) ;;
+    2)
+      error "OpenBao is sealed. Unseal it before running this command."
+      exit 1
+      ;;
+    *)
+      error "OpenBao did not answer a status request (BAO_ADDR=${BAO_ADDR:-${VAULT_ADDR:-unset}})."
+      warn "It may be down, unreachable or wedged. Set BAO_SETUP_SKIP_PREFLIGHT=1 to skip this check."
+      exit 1
+      ;;
+  esac
+}
+
 confirm() {
   echo -en "${Y}  ?  $1 [y/N] ${NC}"; read -r ans
   [[ "$ans" =~ ^[Yy]$ ]]
@@ -72,8 +108,10 @@ show_help() {
   echo -e "  ${C}./bao-setup.sh renew-public-token heylomeet production${NC}"
   echo ""
   echo -e "  ${W}${BOLD}ENVIRONMENT${NC}"
-  echo -e "  ${Y}BAO_ADDR${NC}       OpenBao server address  (e.g. https://bao.example.com:8200)"
-  echo -e "  ${Y}BAO_TOKEN${NC}      Root / admin token for management operations"
+  echo -e "  ${Y}BAO_ADDR${NC}            OpenBao server address  (e.g. https://bao.example.com:8200)"
+  echo -e "  ${Y}BAO_TOKEN${NC}           Root / admin token for management operations"
+  echo -e "  ${Y}BAO_CLIENT_TIMEOUT${NC}  Per-request timeout in seconds (default 40)"
+  echo -e "  ${Y}BAO_MAX_RETRIES${NC}     Retries for 5xx responses (default 0)"
   echo ""
 }
 
@@ -570,21 +608,26 @@ path \"${MOUNT_PATH}/metadata/${PATH_PRIVATE}/*\" {
 
 # ─── Entry point ──────────────────────────────────────────
 require_bao
+configure_client
 
 CMD="${1:-help}"
 shift || true
 
 case "$CMD" in
   setup|add-app)
+    require_server
     cmd_setup
     ;;
   list)
+    require_server
     cmd_list
     ;;
   renew-public-token)
+    require_server
     cmd_renew_public_token "$@"
     ;;
   revoke)
+    require_server
     cmd_revoke
     ;;
   help|--help|-h)

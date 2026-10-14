@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# A stand-in for the bao CLI: records every call and answers from FAKE_* variables.
+# Calls go to $FAKE_BAO_DIR/calls.log, one line each, with the BAO_TOKEN the call used.
+set -u
+dir="${FAKE_BAO_DIR:?}"
+printf 'TOKEN=%s TIMEOUT=%s RETRIES=%s ARGS=%s\n' \
+  "${BAO_TOKEN:-}" "${BAO_CLIENT_TIMEOUT:-}" "${BAO_MAX_RETRIES:-}" "$*" >> "$dir/calls.log"
+
+case "${1:-} ${2:-}" in
+  "status "*) exit "${FAKE_STATUS_RC:-0}" ;;
+  "secrets list") echo '{"sys/": {}}' ;;
+  "auth list") echo '{"approle/": {}}' ;;
+  "policy write") cat > "$dir/policy-$3.hcl" ;;
+  "read -field=role_id") echo role-id-value ;;
+  "write -f") echo secret-id-value ;;
+  "write -field=token")
+    cat > "$dir/login.stdin"
+    [[ "${FAKE_LOGIN_FAIL:-}" == "1" ]] && { echo "invalid role or secret ID" >&2; exit 2; }
+    [[ "${FAKE_WARN_TTL:-}" == "1" ]] && echo "WARNING: Endpoint ignored these unrecognized parameters: [ttl]" >&2
+    echo "login-token-sentinel"
+    ;;
+  "token lookup") [[ "${FAKE_LOOKUP_FAIL:-}" == "1" ]] && exit 2; echo "${FAKE_TTL:-899}" ;;
+  "token revoke") [[ "${FAKE_REVOKE_FAIL:-}" == "1" ]] && exit 2 ;;
+  "kv get") [[ "${FAKE_READ_FAIL:-}" == "1" ]] && exit 2; echo "secret-value-sentinel" ;;
+esac
+exit 0
