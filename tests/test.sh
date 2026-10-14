@@ -169,7 +169,7 @@ new_case; printf 'stored-login-token-sentinel' > "$FAKE_BAO_DIR/.vault-token"
 EXTRA_ENV=(BAO_ROLE_ID=role-id-sentinel BAO_SECRET_ID=secret-id-sentinel); run_script "" check-approle --read demo/staging/private
 login_line="$(calls | grep 'ARGS=write -field=token auth/approle/login' || true)"
 check "a token stored by bao login is not sent with the login" \
-  "$([[ $rc -eq 0 && -n $login_line && $login_line == 'TOKEN= '* ]] && echo 0 || echo 1)"
+  "$([[ $rc -eq 0 && -n $login_line && $login_line == *' TOKEN= TIMEOUT'* ]] && echo 0 || echo 1)"
 check "the login runs in a throwaway HOME that is removed afterwards" \
   "$(login_home="$(sed -n 's/.* HOME=\([^ ]*\) ARGS=write -field=token.*/\1/p' <<< "$login_line")"; [[ -n $login_home && $login_home != "$FAKE_BAO_DIR" && ! -e $login_home ]] && echo 0 || echo 1)"
 EXTRA_ENV=()
@@ -202,17 +202,43 @@ EXTRA_ENV=(BAO_ROLE_ID=role-id-sentinel BAO_SECRET_ID=env-secret-id-sentinel); r
 check "a file and BAO_SECRET_ID together are refused" "$([[ $rc -ne 0 ]] && output_has 'not both' && ! has_call 'approle/login' && echo 0 || echo 1)"
 EXTRA_ENV=()
 
-# --- interrupts and termination while a read is open -----------------------------
+# --- a failed or interrupted revoke is retried -----------------------------------
+new_case; EXTRA_ENV=("${creds[@]}" FAKE_REVOKE_FAIL_ONCE=1); run_script "" check-approle
+check "a revoke that fails is retried on exit and the failure is still reported" \
+  "$([[ $rc -ne 0 && $(count_calls 'TOKEN=login-token-sentinel .*ARGS=token revoke -self') -eq 2 ]] && output_has 'Could not revoke' && echo 0 || echo 1)"
+
+new_case; EXTRA_ENV=("${creds[@]}" FAKE_REVOKE_FAIL=1); run_script "" check-approle
+check "a revoke that keeps failing is tried twice, not forever" \
+  "$([[ $rc -ne 0 && $(count_calls 'TOKEN=login-token-sentinel .*ARGS=token revoke -self') -eq 2 ]] && echo 0 || echo 1)"
+
+new_case; EXTRA_ENV=("${creds[@]}"); run_script "" check-approle
+check "a revoke that succeeds is not repeated on exit" \
+  "$([[ $rc -eq 0 && $(count_calls 'ARGS=token revoke -self') -eq 1 ]] && echo 0 || echo 1)"
+
+# --- no CLI config reaches the login -----------------------------------------------
+new_case; EXTRA_ENV=("${creds[@]}" BAO_CONFIG_PATH=/etc/bao/admin.hcl VAULT_CONFIG_PATH=/etc/vault/admin.hcl)
+run_script "" check-approle --read demo/staging/private
+login_line="$(calls | grep 'ARGS=write -field=token auth/approle/login' || true)"
+check "BAO_CONFIG_PATH and VAULT_CONFIG_PATH are not passed to the login" \
+  "$([[ $rc -eq 0 && -n $login_line && $login_line == 'CONFIG= TOKEN='* ]] && echo 0 || echo 1)"
+check "the test environment really carries the config paths to the other calls" \
+  "$(calls | grep 'ARGS=status' | grep -q 'CONFIG=/etc/bao/admin.hcl/etc/vault/admin.hcl' && echo 0 || echo 1)"
+EXTRA_ENV=()
+
+# --- interrupts and termination --------------------------------------------------------
 # The shell is started in its own session with default signal handling (a background job
 # of this script would inherit "ignore SIGINT"). "group" signals the whole process group, as
-# a terminal does for Ctrl-C; "shell" signals only the script while its read is still running.
-signal_check() { # signal, target (group|shell), expected exit status
+# a terminal does for Ctrl-C; "shell" signals only the script while its call is still running.
+# The blocker holds either the read or the first revoke open.
+signal_check() { # signal, target (group|shell), expected exit status, blocker (read|revoke), revokes
   new_case
-  EXTRA_ENV=(BAO_ROLE_ID=role-id-sentinel BAO_SECRET_ID=secret-id-sentinel FAKE_BLOCK_READ=1)
+  local blocker="FAKE_BLOCK_READ=1" extra=(--read demo/staging/private)
+  if [[ "$4" == revoke ]]; then blocker="FAKE_BLOCK_REVOKE_ONCE=1"; extra=(); fi
+  EXTRA_ENV=(BAO_ROLE_ID=role-id-sentinel BAO_SECRET_ID=secret-id-sentinel "$blocker")
   env -i HOME="$FAKE_BAO_DIR" PATH="$FAKE_BAO_DIR/bin:/usr/bin:/bin" FAKE_BAO_DIR="$FAKE_BAO_DIR" \
     BAO_ADDR=https://bao.example "${EXTRA_ENV[@]}" \
     perl -MPOSIX -e 'POSIX::setsid(); $SIG{INT} = "DEFAULT"; $SIG{TERM} = "DEFAULT"; exec @ARGV or die' -- \
-    bash "$ROOT/bao-setup-vault.sh" check-approle --read demo/staging/private > "$out" 2>&1 &
+    bash "$ROOT/bao-setup-vault.sh" check-approle "${extra[@]+"${extra[@]}"}" > "$out" 2>&1 &
   local pid=$! group="" waited=0
   while [[ ! -s "$FAKE_BAO_DIR/blocked" && $waited -lt 100 ]]; do sleep 0.1; waited=$((waited + 1)); done
   group="$(cat "$FAKE_BAO_DIR/blocked" 2>/dev/null)"
@@ -221,14 +247,17 @@ signal_check() { # signal, target (group|shell), expected exit status
   fi
   wait "$pid"; rc=$?
   [[ -z "$group" ]] || kill -KILL -- "-$group" 2> /dev/null || true
-  check "SIG$1 to the $2 during a read still revokes the token and exits $3" \
-    "$([[ -n $group && $rc -eq $3 && $(count_calls 'TOKEN=login-token-sentinel .*ARGS=token revoke -self') -eq 1 ]] && echo 0 || echo 1)"
+  check "SIG$1 to the $2 during a $4 still revokes the token ($5 revoke calls) and exits $3" \
+    "$([[ -n $group && $rc -eq $3 && $(count_calls 'TOKEN=login-token-sentinel .*ARGS=token revoke -self') -eq $5 ]] && echo 0 || echo 1)"
   EXTRA_ENV=()
 }
 if command -v perl > /dev/null; then
-  signal_check INT group 130
-  signal_check TERM group 143
-  signal_check TERM shell 143
+  signal_check INT group 130 read 1
+  signal_check TERM group 143 read 1
+  signal_check TERM shell 143 read 1
+  # The interrupted revoke never finished, so the exit trap revokes again.
+  signal_check TERM group 143 revoke 2
+  signal_check TERM shell 143 revoke 2
 else
   echo "skip - signal tests need perl"
 fi

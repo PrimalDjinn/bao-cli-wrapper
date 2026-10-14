@@ -335,11 +335,12 @@ CHECK_TOKEN=""
 CHECK_ERRORS=""
 CHECK_HOME=""
 
+# The token is forgotten only once it is revoked, so if the revoke is interrupted or fails, the
+# EXIT trap tries again.
 revoke_check_token() {
   [[ -n "${CHECK_TOKEN}" ]] || return 0
-  local token="${CHECK_TOKEN}"
+  BAO_TOKEN="${CHECK_TOKEN}" bao token revoke -self &>/dev/null || return 1
   CHECK_TOKEN=""
-  BAO_TOKEN="${token}" bao token revoke -self &>/dev/null
 }
 
 cleanup_check() {

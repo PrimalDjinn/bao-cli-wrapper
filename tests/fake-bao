@@ -6,8 +6,9 @@ dir="${FAKE_BAO_DIR:?}"
 # Like the real CLI, fall back to the token `bao login` stored in ~/.vault-token.
 token="${BAO_TOKEN:-}"
 if [[ -z "$token" && -r "${HOME:-/nonexistent}/.vault-token" ]]; then token="$(cat "$HOME/.vault-token")"; fi
-printf 'TOKEN=%s TIMEOUT=%s RETRIES=%s HOME=%s ARGS=%s\n' \
-  "$token" "${BAO_CLIENT_TIMEOUT:-}" "${BAO_MAX_RETRIES:-}" "${HOME:-}" "$*" >> "$dir/calls.log"
+printf 'CONFIG=%s TOKEN=%s TIMEOUT=%s RETRIES=%s HOME=%s ARGS=%s\n' \
+  "${BAO_CONFIG_PATH:-}${VAULT_CONFIG_PATH:-}" "$token" "${BAO_CLIENT_TIMEOUT:-}" "${BAO_MAX_RETRIES:-}" \
+  "${HOME:-}" "$*" >> "$dir/calls.log"
 
 case "${1:-} ${2:-}" in
   "status "*) exit "${FAKE_STATUS_RC:-0}" ;;
@@ -23,7 +24,19 @@ case "${1:-} ${2:-}" in
     echo "login-token-sentinel"
     ;;
   "token lookup") [[ "${FAKE_LOOKUP_FAIL:-}" == "1" ]] && exit 2; echo "${FAKE_TTL:-899}" ;;
-  "token revoke") [[ "${FAKE_REVOKE_FAIL:-}" == "1" ]] && exit 2 ;;
+  "token revoke")
+    if [[ "${FAKE_BLOCK_REVOKE_ONCE:-}" == "1" && ! -e "$dir/revoke-blocked" ]]; then
+      # Hold the first revoke open and say which process group to signal.
+      touch "$dir/revoke-blocked"
+      ps -o pgid= -p $$ | tr -d ' ' > "$dir/blocked"
+      sleep 30
+    fi
+    if [[ "${FAKE_REVOKE_FAIL_ONCE:-}" == "1" && ! -e "$dir/revoke-failed" ]]; then
+      touch "$dir/revoke-failed"
+      exit 2
+    fi
+    [[ "${FAKE_REVOKE_FAIL:-}" == "1" ]] && exit 2
+    ;;
   "kv get")
     if [[ "${FAKE_BLOCK_READ:-}" == "1" ]]; then
       # Hold the read open and say which process group to signal.
