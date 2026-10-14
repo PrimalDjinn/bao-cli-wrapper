@@ -60,15 +60,48 @@ EXTRA_ENV=()
 
 # --- private policy lets a token inspect and revoke itself ---------------------
 for keys in "" "api-key"; do
-  new_case; run_script "demo\nstaging\n2\n${keys}\n\ny\n" setup
+  new_case; run_script "demo\nstaging\n2\n${keys}\n\n\ny\n" setup
   policy="$FAKE_BAO_DIR/policy-demo-staging-private.hcl"
   check "private policy (keys='${keys}') grants revoke-self and lookup-self" \
     "$([[ $rc -eq 0 && -f $policy ]] && grep -q 'path "auth/token/revoke-self"' "$policy" && grep -q 'path "auth/token/lookup-self"' "$policy" && echo 0 || echo 1)"
 done
 
-new_case; run_script "demo\nstaging\n1\n\n\ny\n" setup
+new_case; run_script "demo\nstaging\n1\n\n\n\ny\n" setup
 check "the public policy never grants token self-service" \
   "$([[ -f $FAKE_BAO_DIR/policy-demo-staging-public.hcl ]] && ! grep -q 'auth/token' "$FAKE_BAO_DIR/policy-demo-staging-public.hcl" && echo 0 || echo 1)"
+
+# --- short AppRole token lifetimes ---------------------------------------------
+role_call() { calls | grep 'ARGS=write auth/approle/role/' || true; }
+no_role_written() { [[ -z "$(role_call)" ]] && ! has_call 'policy write' && ! has_call 'secrets enable'; }
+
+new_case; run_script "demo\nstaging\n2\n\n\n\ny\n" setup
+check "a new role defaults to a 10 minute token with a 1 hour maximum" \
+  "$(role_call | grep -q 'token_ttl=10m token_max_ttl=1h ' && ! has_call '8760h' && output_has 'Token TTL' && echo 0 || echo 1)"
+
+new_case; run_script "demo\nstaging\n2\n\n30m\n2h\ny\n" setup
+check "the prompts override both lifetimes" "$(role_call | grep -q 'token_ttl=30m token_max_ttl=2h ' && echo 0 || echo 1)"
+
+new_case; EXTRA_ENV=(BAO_SETUP_TOKEN_TTL=5m BAO_SETUP_TOKEN_MAX_TTL=45m); run_script "demo\nstaging\n2\n\n\n\ny\n" setup
+check "the environment changes the defaults offered" "$(role_call | grep -q 'token_ttl=5m token_max_ttl=45m ' && output_has '\[5m\]' && echo 0 || echo 1)"
+EXTRA_ENV=()
+
+new_case; run_script "demo\nstaging\n2\n\n720h\n720h\ny\n" setup
+check "an app that needs longer tokens can ask for them" "$(role_call | grep -q 'token_ttl=720h token_max_ttl=720h ' && echo 0 || echo 1)"
+
+new_case; run_script "demo\nstaging\n2\n\n0\n0\ny\n" setup
+check "0 leaves both lifetimes to the server" "$(role_call | grep -q 'token_renewable=true secret_id_num_uses=0' && ! role_call | grep -q 'token_ttl\|token_max_ttl' && echo 0 || echo 1)"
+
+new_case; run_script "demo\nstaging\n2\n\n90m\n1h30m\ny\n" setup
+check "a TTL equal to the maximum is accepted across units" "$([[ $rc -eq 0 ]] && role_call | grep -q 'token_ttl=90m token_max_ttl=1h30m ' && echo 0 || echo 1)"
+
+new_case; run_script "demo\nstaging\n2\n\n91m\n1h30m\ny\n" setup
+check "a TTL above the maximum is rejected before anything is written" "$([[ $rc -ne 0 ]] && output_has 'cannot exceed' && no_role_written && echo 0 || echo 1)"
+
+new_case; run_script "demo\nstaging\n2\n\n10m token_policies=root\n1h\ny\n" setup
+check "a TTL that tries to add another argument is rejected" "$([[ $rc -ne 0 ]] && output_has 'Invalid token TTL' && no_role_written && ! calls | grep -q 'token_policies=root' && echo 0 || echo 1)"
+
+new_case; run_script "demo\nstaging\n2\n\n10m\nsoon\ny\n" setup
+check "an invalid maximum is rejected" "$([[ $rc -ne 0 ]] && output_has 'Invalid token max TTL' && no_role_written && echo 0 || echo 1)"
 
 # --- check-approle -------------------------------------------------------------
 creds=(BAO_ROLE_ID=role-id-sentinel BAO_SECRET_ID=secret-id-sentinel BAO_TOKEN=admin-token-sentinel)

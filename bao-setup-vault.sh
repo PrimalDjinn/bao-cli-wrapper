@@ -116,6 +116,8 @@ show_help() {
   echo -e "  ${Y}BAO_TOKEN${NC}           Root / admin token for management operations"
   echo -e "  ${Y}BAO_CLIENT_TIMEOUT${NC}  Per-request timeout in seconds (default 40)"
   echo -e "  ${Y}BAO_MAX_RETRIES${NC}     Retries for 5xx responses (default 0)"
+  echo -e "  ${Y}BAO_SETUP_TOKEN_TTL${NC}      setup: default AppRole token TTL (default 10m)"
+  echo -e "  ${Y}BAO_SETUP_TOKEN_MAX_TTL${NC}  setup: default AppRole token max TTL (default 1h)"
   echo -e "  ${Y}BAO_ROLE_ID${NC}         check-approle: role ID (prompted when unset)"
   echo -e "  ${Y}BAO_SECRET_ID${NC}       check-approle: secret ID (prompted when unset)"
   echo -e "  ${Y}BAO_LOGIN_TTL${NC}       check-approle: token TTL to request, e.g. 15m"
@@ -134,6 +136,53 @@ path "auth/token/revoke-self" {
   capabilities = ["update"]
 }
 '
+
+# AppRole token lifetimes. Every login creates a token that OpenBao keeps, in memory and in
+# storage, until it expires, so the defaults are short. Override them per run at the prompts,
+# or for scripted runs with BAO_SETUP_TOKEN_TTL and BAO_SETUP_TOKEN_MAX_TTL.
+DEFAULT_TOKEN_TTL="${BAO_SETUP_TOKEN_TTL:-10m}"
+DEFAULT_TOKEN_MAX_TTL="${BAO_SETUP_TOKEN_MAX_TTL:-1h}"
+
+# Prints the number of seconds in a duration: plain seconds, or Go-style units such as 10m,
+# 1h or 1h30m. Fails on anything else, so a value can never smuggle in another argument.
+duration_seconds() {
+  local rest="$1" total=0 number unit
+  if [[ "${rest}" =~ ^[0-9]{1,9}$ ]]; then
+    echo "$((10#${rest}))"
+    return 0
+  fi
+  [[ "${rest}" =~ ^([0-9]{1,9}[smhd])+$ ]] || return 1
+  while [[ -n "${rest}" ]]; do
+    [[ "${rest}" =~ ^([0-9]{1,9})([smhd])(.*)$ ]] || return 1
+    number="${BASH_REMATCH[1]}"
+    unit="${BASH_REMATCH[2]}"
+    rest="${BASH_REMATCH[3]}"
+    case "${unit}" in
+      s) total=$((total + 10#${number})) ;;
+      m) total=$((total + 10#${number} * 60)) ;;
+      h) total=$((total + 10#${number} * 3600)) ;;
+      d) total=$((total + 10#${number} * 86400)) ;;
+    esac
+  done
+  echo "${total}"
+}
+
+# 0 leaves a lifetime to the server default. A token cannot be asked to outlive its maximum.
+validate_token_lifetimes() {
+  local ttl="$1" max="$2" ttl_seconds max_seconds
+  if ! ttl_seconds="$(duration_seconds "${ttl}")"; then
+    error "Invalid token TTL '${ttl}'. Use seconds or a duration such as 10m or 1h."
+    return 1
+  fi
+  if ! max_seconds="$(duration_seconds "${max}")"; then
+    error "Invalid token max TTL '${max}'. Use seconds or a duration such as 10m or 1h."
+    return 1
+  fi
+  if (( ttl_seconds > 0 && max_seconds > 0 && ttl_seconds > max_seconds )); then
+    error "The token TTL (${ttl}) cannot exceed the token max TTL (${max})."
+    return 1
+  fi
+}
 
 # ─── PUBLIC TOKEN HELPERS ────────────────────────────────
 public_token_id_for() {
@@ -296,9 +345,8 @@ cleanup_check() {
   revoke_check_token || true
 }
 
-# Seconds, or Go-style durations such as 15m, 1h or 1h30m.
 valid_login_ttl() {
-  [[ "$1" =~ ^[0-9]+$ || "$1" =~ ^([0-9]+[smhd])+$ ]]
+  duration_seconds "$1" &>/dev/null
 }
 
 cmd_check_approle() {
@@ -443,10 +491,13 @@ cmd_setup() {
       ;;
   esac
 
-  info "Every login creates a token that OpenBao keeps until it expires. A short TTL (e.g. 1h)"
-  info "limits build-up when applications log in often; reuse the token and revoke it when done."
-  ask "AppRole TTL for private access (e.g. 8760h, 0=infinite) [8760h]:" TOKEN_TTL_INPUT
-  TOKEN_TTL="${TOKEN_TTL_INPUT:-8760h}"
+  info "Every login creates a token that OpenBao keeps until it expires, so lifetimes are short by"
+  info "default. Raise them only for an app that needs longer; 0 leaves a lifetime to the server."
+  ask "AppRole token TTL for private access (e.g. 10m) [${DEFAULT_TOKEN_TTL}]:" TOKEN_TTL_INPUT
+  TOKEN_TTL="${TOKEN_TTL_INPUT:-${DEFAULT_TOKEN_TTL}}"
+  ask "AppRole token max TTL, renewals included (e.g. 1h) [${DEFAULT_TOKEN_MAX_TTL}]:" TOKEN_MAX_TTL_INPUT
+  TOKEN_MAX_TTL="${TOKEN_MAX_TTL_INPUT:-${DEFAULT_TOKEN_MAX_TTL}}"
+  validate_token_lifetimes "$TOKEN_TTL" "$TOKEN_MAX_TTL" || exit 1
 
   # ── Warn if no keys specified ──
   if [[ -z "$PUBLIC_KEYS" && -z "$PRIVATE_KEYS" ]]; then
@@ -480,6 +531,9 @@ cmd_setup() {
   [[ -n "$PRIVATE_KEYS" ]] && echo -e "  Private keys: ${R}${PRIVATE_KEYS}${NC}"
   [[ -z "$PUBLIC_KEYS" && "$VISIBILITY" != "2" ]] && echo -e "  Public keys : ${Y}(wildcard — add exact keys via UI later)${NC}"
   [[ -z "$PRIVATE_KEYS" && "$VISIBILITY" != "1" ]] && echo -e "  Private keys: ${Y}(wildcard — add exact keys via UI later)${NC}"
+  if [[ "$VISIBILITY" != "1" ]]; then
+    echo -e "  Token TTL   : ${W}${TOKEN_TTL}${NC} ${DIM}(max ${TOKEN_MAX_TTL})${NC}"
+  fi
 
   divider
   confirm "Apply this configuration?" || { warn "Aborted."; exit 0; }
@@ -630,14 +684,15 @@ path \"${MOUNT_PATH}/metadata/${PATH_PRIVATE}/*\" {
     # Configure AppRole
     info "Configuring AppRole: ${role_name}…"
 
-    local ttl_flag=""
-    [[ "$TOKEN_TTL" != "0" ]] && ttl_flag="token_ttl=${TOKEN_TTL}"
+    local -a ttl_args=()
+    if [[ "$TOKEN_TTL" != "0" ]]; then ttl_args+=("token_ttl=${TOKEN_TTL}"); fi
+    if [[ "$TOKEN_MAX_TTL" != "0" ]]; then ttl_args+=("token_max_ttl=${TOKEN_MAX_TTL}"); fi
 
     bao write auth/approle/role/"${role_name}" \
       token_policies="${priv_policy_name}" \
       token_no_default_policy=true \
       token_renewable=true \
-      ${ttl_flag} \
+      ${ttl_args[@]+"${ttl_args[@]}"} \
       secret_id_num_uses=0 \
       secret_id_ttl=0 &>/dev/null \
       && success "AppRole '${role_name}' configured."
