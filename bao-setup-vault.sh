@@ -120,6 +120,7 @@ show_help() {
   echo -e "  ${Y}BAO_SETUP_TOKEN_MAX_TTL${NC}  setup: default AppRole token max TTL (default 1h)"
   echo -e "  ${Y}BAO_ROLE_ID${NC}         check-approle: role ID (prompted when unset)"
   echo -e "  ${Y}BAO_SECRET_ID${NC}       check-approle: secret ID (prompted when unset)"
+  echo -e "  ${Y}BAO_SECRET_ID_FILE${NC}  check-approle: private file holding the secret ID (--secret-id-file)"
   echo -e "  ${Y}BAO_LOGIN_TTL${NC}       check-approle: token TTL to request, e.g. 15m"
   echo ""
 }
@@ -332,6 +333,7 @@ cmd_renew_public_token() {
 # stdin), so the check leaves no long-lived token behind.
 CHECK_TOKEN=""
 CHECK_ERRORS=""
+CHECK_HOME=""
 
 revoke_check_token() {
   [[ -n "${CHECK_TOKEN}" ]] || return 0
@@ -342,7 +344,26 @@ revoke_check_token() {
 
 cleanup_check() {
   [[ -z "${CHECK_ERRORS}" ]] || rm -f "${CHECK_ERRORS}"
+  [[ -z "${CHECK_HOME}" ]] || rm -rf "${CHECK_HOME}"
   revoke_check_token || true
+}
+
+# Reads a secret ID from the first line of a private file, so it never touches a command
+# line, a shell history or the process environment.
+read_secret_id_file() {
+  local file="$1" mode
+  if [[ ! -f "${file}" || -L "${file}" ]]; then
+    error "The secret ID file must be a regular file, not a symlink."
+    return 1
+  fi
+  mode="$(stat -c '%a' "${file}" 2>/dev/null || stat -f '%Lp' "${file}" 2>/dev/null || true)"
+  if [[ -z "${mode}" || "${mode: -2}" != "00" ]]; then
+    error "The secret ID file must not be accessible to group or others (chmod 600)."
+    return 1
+  fi
+  SECRET_ID_FROM_FILE=""
+  IFS= read -r SECRET_ID_FROM_FILE < "${file}" || true
+  [[ -n "${SECRET_ID_FROM_FILE}" ]] || { error "The secret ID file is empty."; return 1; }
 }
 
 valid_login_ttl() {
@@ -354,10 +375,15 @@ cmd_check_approle() {
   label "  Check AppRole Login"
   divider
 
-  local requested_ttl="${BAO_LOGIN_TTL:-}"
+  local requested_ttl="${BAO_LOGIN_TTL:-}" secret_id_file="${BAO_SECRET_ID_FILE:-}"
   local -a reads=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --secret-id-file)
+        [[ $# -ge 2 ]] || { error "--secret-id-file needs a path."; exit 1; }
+        secret_id_file="$2"
+        shift 2
+        ;;
       --ttl)
         [[ $# -ge 2 ]] || { error "--ttl needs a duration, e.g. 15m."; exit 1; }
         requested_ttl="$2"
@@ -381,6 +407,15 @@ cmd_check_approle() {
   fi
 
   local role_id="${BAO_ROLE_ID:-}" secret_id="${BAO_SECRET_ID:-}"
+  if [[ -n "${secret_id_file}" ]]; then
+    if [[ -n "${secret_id}" ]]; then
+      error "Use either a secret ID file or BAO_SECRET_ID, not both."
+      exit 1
+    fi
+    read_secret_id_file "${secret_id_file}" || exit 1
+    secret_id="${SECRET_ID_FROM_FILE}"
+    SECRET_ID_FROM_FILE=""
+  fi
   if [[ -z "${role_id}" ]]; then ask "Role ID:" role_id; fi
   if [[ -z "${secret_id}" ]]; then ask_secret "Secret ID:" secret_id; fi
   if [[ ! "${role_id}" =~ ^[A-Za-z0-9._-]+$ || ! "${secret_id}" =~ ^[A-Za-z0-9._-]+$ ]]; then
@@ -395,12 +430,16 @@ cmd_check_approle() {
 
   local token
   CHECK_ERRORS="$(mktemp)"
+  CHECK_HOME="$(mktemp -d)"
+  # bash runs the EXIT trap on exit and when a signal ends the script, so the token is revoked
+  # on every path. Separate INT and TERM traps would only delay it until a running read ends.
   trap cleanup_check EXIT
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
 
-  # The admin token is not sent: this checks the role on its own.
+  # No admin credential reaches the login, so it checks the role on its own. BAO_TOKEN and
+  # VAULT_TOKEN are removed, and an empty HOME hides the token that `bao login` stores in
+  # ~/.vault-token and any token helper named in the CLI's config file.
   if ! token="$(printf '%s' "${payload}" | env -u BAO_TOKEN -u VAULT_TOKEN \
+      -u BAO_CONFIG_PATH -u VAULT_CONFIG_PATH HOME="${CHECK_HOME}" \
       bao write -field=token auth/approle/login - 2>"${CHECK_ERRORS}")" || [[ -z "${token}" ]]; then
     error "AppRole login failed: check the credentials, the role, and that OpenBao is reachable."
     exit 1

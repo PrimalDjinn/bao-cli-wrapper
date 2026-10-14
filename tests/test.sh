@@ -66,6 +66,18 @@ for keys in "" "api-key"; do
     "$([[ $rc -eq 0 && -f $policy ]] && grep -q 'path "auth/token/revoke-self"' "$policy" && grep -q 'path "auth/token/lookup-self"' "$policy" && echo 0 || echo 1)"
 done
 
+check_self_capabilities() { # policy file: exactly lookup-self (read) and revoke-self (update)
+  local policy="$1"
+  grep -A1 'path "auth/token/revoke-self"' "$policy" | grep -q 'capabilities = \["update"\]' &&
+    grep -A1 'path "auth/token/lookup-self"' "$policy" | grep -q 'capabilities = \["read"\]' &&
+    [[ $(grep -c 'auth/token/' "$policy") -eq 2 ]]
+}
+for keys in "" "api-key"; do
+  new_case; run_script "demo\nstaging\n2\n${keys}\n\n\ny\n" setup
+  check "private policy (keys='${keys}') grants revoke-self update, lookup-self read and nothing else under auth/token" \
+    "$(check_self_capabilities "$FAKE_BAO_DIR/policy-demo-staging-private.hcl" && echo 0 || echo 1)"
+done
+
 new_case; run_script "demo\nstaging\n1\n\n\n\ny\n" setup
 check "the public policy never grants token self-service" \
   "$([[ -f $FAKE_BAO_DIR/policy-demo-staging-public.hcl ]] && ! grep -q 'auth/token' "$FAKE_BAO_DIR/policy-demo-staging-public.hcl" && echo 0 || echo 1)"
@@ -111,7 +123,7 @@ login="$(cat "$FAKE_BAO_DIR/login.stdin" 2>/dev/null)"
 check "login sends the role, secret and requested ttl as JSON on stdin" \
   "$([[ $login == '{"role_id":"role-id-sentinel","secret_id":"secret-id-sentinel","ttl":"15m"}' ]] && echo 0 || echo 1)"
 check "the secret ID is never a process argument" "$(calls | grep -q 'secret-id-sentinel' && echo 1 || echo 0)"
-check "the login does not send the admin token" "$(has_call 'TOKEN= TIMEOUT=40 RETRIES=0 ARGS=write -field=token auth/approle/login -' && echo 0 || echo 1)"
+check "the login does not send the admin token" "$(has_call 'TOKEN= TIMEOUT=40 RETRIES=0 HOME=[^ ]* ARGS=write -field=token auth/approle/login -' && echo 0 || echo 1)"
 check "one login serves every read" "$([[ $(count_calls 'ARGS=write -field=token') -eq 1 && $(count_calls 'TOKEN=login-token-sentinel .*ARGS=kv get') -eq 2 ]] && echo 0 || echo 1)"
 check "the token is revoked once with revoke-self after the reads" \
   "$([[ $(count_calls 'TOKEN=login-token-sentinel .*ARGS=token revoke -self') -eq 1 ]] && [[ $(calls | grep -n 'kv get' | tail -1 | cut -d: -f1) -lt $(calls | grep -n 'revoke -self' | cut -d: -f1) ]] && echo 0 || echo 1)"
@@ -151,6 +163,75 @@ check "missing credentials are prompted for" "$([[ $rc -eq 0 ]] && grep -q '"rol
 
 new_case; EXTRA_ENV=("${creds[@]}"); run_script "" check-approle --bogus
 check "unknown options are rejected" "$([[ $rc -ne 0 ]] && output_has 'Unknown option' && ! has_call 'approle/login' && echo 0 || echo 1)"
+
+# --- the login uses no ambient credential -------------------------------------
+new_case; printf 'stored-login-token-sentinel' > "$FAKE_BAO_DIR/.vault-token"
+EXTRA_ENV=(BAO_ROLE_ID=role-id-sentinel BAO_SECRET_ID=secret-id-sentinel); run_script "" check-approle --read demo/staging/private
+login_line="$(calls | grep 'ARGS=write -field=token auth/approle/login' || true)"
+check "a token stored by bao login is not sent with the login" \
+  "$([[ $rc -eq 0 && -n $login_line && $login_line == 'TOKEN= '* ]] && echo 0 || echo 1)"
+check "the login runs in a throwaway HOME that is removed afterwards" \
+  "$(login_home="$(sed -n 's/.* HOME=\([^ ]*\) ARGS=write -field=token.*/\1/p' <<< "$login_line")"; [[ -n $login_home && $login_home != "$FAKE_BAO_DIR" && ! -e $login_home ]] && echo 0 || echo 1)"
+EXTRA_ENV=()
+
+# --- the secret ID from a file --------------------------------------------------
+new_case; printf 'file-secret-id-sentinel\n' > "$FAKE_BAO_DIR/secret"; chmod 600 "$FAKE_BAO_DIR/secret"
+EXTRA_ENV=(BAO_ROLE_ID=role-id-sentinel); run_script "" check-approle --secret-id-file "$FAKE_BAO_DIR/secret"
+check "a secret ID can come from a private file and never from an argument" \
+  "$([[ $rc -eq 0 ]] && grep -q '"secret_id":"file-secret-id-sentinel"' "$FAKE_BAO_DIR/login.stdin" && ! calls | grep -q 'file-secret-id-sentinel' && echo 0 || echo 1)"
+
+new_case; printf 'file-secret-id-sentinel\n' > "$FAKE_BAO_DIR/secret"; chmod 600 "$FAKE_BAO_DIR/secret"
+EXTRA_ENV=(BAO_ROLE_ID=role-id-sentinel BAO_SECRET_ID_FILE="$FAKE_BAO_DIR/secret"); run_script "" check-approle
+check "BAO_SECRET_ID_FILE works like the flag" "$([[ $rc -eq 0 ]] && grep -q 'file-secret-id-sentinel' "$FAKE_BAO_DIR/login.stdin" && echo 0 || echo 1)"
+
+new_case; printf 'file-secret-id-sentinel\n' > "$FAKE_BAO_DIR/secret"; chmod 640 "$FAKE_BAO_DIR/secret"
+EXTRA_ENV=(BAO_ROLE_ID=role-id-sentinel); run_script "" check-approle --secret-id-file "$FAKE_BAO_DIR/secret"
+check "a secret ID file readable by the group is refused before any login" \
+  "$([[ $rc -ne 0 ]] && output_has 'chmod 600' && ! has_call 'approle/login' && echo 0 || echo 1)"
+
+new_case; printf 'file-secret-id-sentinel\n' > "$FAKE_BAO_DIR/secret"; chmod 600 "$FAKE_BAO_DIR/secret"; ln -s "$FAKE_BAO_DIR/secret" "$FAKE_BAO_DIR/link"
+EXTRA_ENV=(BAO_ROLE_ID=role-id-sentinel); run_script "" check-approle --secret-id-file "$FAKE_BAO_DIR/link"
+check "a symlinked secret ID file is refused" "$([[ $rc -ne 0 ]] && output_has 'regular file' && ! has_call 'approle/login' && echo 0 || echo 1)"
+
+new_case; : > "$FAKE_BAO_DIR/empty"; chmod 600 "$FAKE_BAO_DIR/empty"
+EXTRA_ENV=(BAO_ROLE_ID=role-id-sentinel); run_script "" check-approle --secret-id-file "$FAKE_BAO_DIR/empty"
+check "an empty secret ID file is refused" "$([[ $rc -ne 0 ]] && output_has 'empty' && ! has_call 'approle/login' && echo 0 || echo 1)"
+
+new_case; printf 'file-secret-id-sentinel\n' > "$FAKE_BAO_DIR/secret"; chmod 600 "$FAKE_BAO_DIR/secret"
+EXTRA_ENV=(BAO_ROLE_ID=role-id-sentinel BAO_SECRET_ID=env-secret-id-sentinel); run_script "" check-approle --secret-id-file "$FAKE_BAO_DIR/secret"
+check "a file and BAO_SECRET_ID together are refused" "$([[ $rc -ne 0 ]] && output_has 'not both' && ! has_call 'approle/login' && echo 0 || echo 1)"
+EXTRA_ENV=()
+
+# --- interrupts and termination while a read is open -----------------------------
+# The shell is started in its own session with default signal handling (a background job
+# of this script would inherit "ignore SIGINT"). "group" signals the whole process group, as
+# a terminal does for Ctrl-C; "shell" signals only the script while its read is still running.
+signal_check() { # signal, target (group|shell), expected exit status
+  new_case
+  EXTRA_ENV=(BAO_ROLE_ID=role-id-sentinel BAO_SECRET_ID=secret-id-sentinel FAKE_BLOCK_READ=1)
+  env -i HOME="$FAKE_BAO_DIR" PATH="$FAKE_BAO_DIR/bin:/usr/bin:/bin" FAKE_BAO_DIR="$FAKE_BAO_DIR" \
+    BAO_ADDR=https://bao.example "${EXTRA_ENV[@]}" \
+    perl -MPOSIX -e 'POSIX::setsid(); $SIG{INT} = "DEFAULT"; $SIG{TERM} = "DEFAULT"; exec @ARGV or die' -- \
+    bash "$ROOT/bao-setup-vault.sh" check-approle --read demo/staging/private > "$out" 2>&1 &
+  local pid=$! group="" waited=0
+  while [[ ! -s "$FAKE_BAO_DIR/blocked" && $waited -lt 100 ]]; do sleep 0.1; waited=$((waited + 1)); done
+  group="$(cat "$FAKE_BAO_DIR/blocked" 2>/dev/null)"
+  if [[ -n "$group" ]]; then
+    if [[ "$2" == group ]]; then kill "-$1" -- "-$group"; else kill "-$1" "$pid"; fi
+  fi
+  wait "$pid"; rc=$?
+  [[ -z "$group" ]] || kill -KILL -- "-$group" 2> /dev/null || true
+  check "SIG$1 to the $2 during a read still revokes the token and exits $3" \
+    "$([[ -n $group && $rc -eq $3 && $(count_calls 'TOKEN=login-token-sentinel .*ARGS=token revoke -self') -eq 1 ]] && echo 0 || echo 1)"
+  EXTRA_ENV=()
+}
+if command -v perl > /dev/null; then
+  signal_check INT group 130
+  signal_check TERM group 143
+  signal_check TERM shell 143
+else
+  echo "skip - signal tests need perl"
+fi
 
 echo
 echo "$((total - failures))/$total passed"

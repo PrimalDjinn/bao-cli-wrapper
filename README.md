@@ -16,7 +16,7 @@ It needs Bash and the `bao` CLI on `PATH`.
 | `list` | List the policies on the server. |
 | `renew-public-token [app env]` | Revoke and recreate an app's public token. |
 | `revoke` | Revoke a token by ID or accessor. |
-| `check-approle [--ttl 15m] [--read PATH]...` | Log in with an AppRole, read, then revoke the token. |
+| `check-approle [--ttl 15m] [--read PATH]... [--secret-id-file FILE]` | Log in with an AppRole, read, then revoke the token. |
 | `help` | Show usage. |
 
 ```sh
@@ -35,7 +35,8 @@ source .env
 | `BAO_MAX_RETRIES` | all | Retries of 5xx responses. Defaults to 0. |
 | `BAO_SETUP_SKIP_PREFLIGHT` | all | Set to `1` to skip the status check below. |
 | `BAO_SETUP_TOKEN_TTL`, `BAO_SETUP_TOKEN_MAX_TTL` | `setup` | Default AppRole token TTL and max TTL offered at the prompts. Default `10m` and `1h`. |
-| `BAO_ROLE_ID`, `BAO_SECRET_ID` | `check-approle` | AppRole credentials. Prompted for when unset. |
+| `BAO_ROLE_ID`, `BAO_SECRET_ID` | `check-approle` | AppRole credentials. Prompted for when unset; prefer the prompt or a file for the secret ID. |
+| `BAO_SECRET_ID_FILE` | `check-approle` | Private file holding the secret ID. Same as `--secret-id-file`. |
 | `BAO_LOGIN_TTL` | `check-approle` | Token TTL to request. Same as `--ttl`. |
 
 ## Timeouts and a server that does not answer
@@ -104,17 +105,30 @@ tokens behind. In order of preference:
 
 Avoid listing token accessors on a large store: that call enumerates all of them.
 
-`check-approle` shows the pattern and proves a role works without leaving a token behind:
+`check-approle` shows the pattern and proves a role works without leaving a token behind. It
+prompts for the role ID and, without echoing it, the secret ID:
 
 ```sh
-BAO_ROLE_ID=... BAO_SECRET_ID=... \
-  ./bao-setup-vault.sh check-approle --ttl 15m --read myapp/production/private
+./bao-setup-vault.sh check-approle --ttl 15m --read myapp/production/private
 ```
 
-It logs in once with the role alone (the admin token is not sent), reads each `--read` path
-with that same token without printing any value, and revokes the token with revoke-self. The
-exit status is non-zero if the login, a read or the revoke fails. The secret ID is sent on
-stdin, never as a command argument, and neither it nor the token is printed.
+Do not put the secret ID on the command line, where it lands in the shell history and the
+process list. For automation, keep it in a file only you can read and pass the path:
+
+```sh
+./bao-setup-vault.sh check-approle --secret-id-file ~/.config/myapp/secret-id --read myapp/production/private
+```
+
+The file must be a regular file (not a symlink) with no group or other permissions
+(`chmod 600`), and its first line is the secret ID.
+
+The check logs in once with the role alone: it does not send `BAO_TOKEN` or `VAULT_TOKEN`, and
+it runs the login in an empty temporary `HOME`, so a token stored by `bao login`
+(`~/.vault-token`) and any token helper from the CLI's config file are not used either. It reads
+each `--read` path with the new token without printing any value, and revokes the token with
+revoke-self, also when a read fails or the script is interrupted or terminated. The exit status
+is non-zero if the login, a read or the revoke fails. The secret ID is sent on stdin, never as a
+command argument, and neither it nor the token is printed.
 
 `--ttl` is sent as an optional `ttl` field of the login request. A server that does not
 implement it ignores the field and answers with a warning, which the check reports; the role's
