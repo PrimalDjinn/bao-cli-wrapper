@@ -93,6 +93,7 @@ show_help() {
   echo -e "  ${Y}list${NC}                List all bao-setup managed policies"
   echo -e "  ${Y}renew-public-token${NC}  Revoke and recreate a public token"
   echo -e "  ${Y}revoke${NC}              Revoke a token by accessor or token ID"
+  echo -e "  ${Y}check-approle${NC}       Log in with an AppRole, optionally read, then revoke the token"
   echo -e "  ${Y}help${NC}                Show this message"
   divider
   echo ""
@@ -107,13 +108,32 @@ show_help() {
   echo -e "  ${C}./bao-setup.sh renew-public-token${NC}"
   echo -e "  ${C}./bao-setup.sh renew-public-token heylomeet production${NC}"
   echo ""
+  echo -e "  ${DIM}# Prove an AppRole works, with a 15 minute token, then revoke the token${NC}"
+  echo -e "  ${C}./bao-setup.sh check-approle --ttl 15m --read heylomeet/production/private${NC}"
+  echo ""
   echo -e "  ${W}${BOLD}ENVIRONMENT${NC}"
   echo -e "  ${Y}BAO_ADDR${NC}            OpenBao server address  (e.g. https://bao.example.com:8200)"
   echo -e "  ${Y}BAO_TOKEN${NC}           Root / admin token for management operations"
   echo -e "  ${Y}BAO_CLIENT_TIMEOUT${NC}  Per-request timeout in seconds (default 40)"
   echo -e "  ${Y}BAO_MAX_RETRIES${NC}     Retries for 5xx responses (default 0)"
+  echo -e "  ${Y}BAO_ROLE_ID${NC}         check-approle: role ID (prompted when unset)"
+  echo -e "  ${Y}BAO_SECRET_ID${NC}       check-approle: secret ID (prompted when unset)"
+  echo -e "  ${Y}BAO_LOGIN_TTL${NC}       check-approle: token TTL to request, e.g. 15m"
   echo ""
 }
+
+# Roles are created without the default policy, so a private token can neither look up nor
+# revoke itself unless its policy says so. That is what lets an application revoke its token
+# after a one-shot read instead of leaving it to live out its TTL. Public tokens are
+# deliberately excluded: they are safe to expose, so they must not be able to revoke themselves.
+TOKEN_SELF_POLICY='
+path "auth/token/lookup-self" {
+  capabilities = ["read"]
+}
+path "auth/token/revoke-self" {
+  capabilities = ["update"]
+}
+'
 
 # ─── PUBLIC TOKEN HELPERS ────────────────────────────────
 public_token_id_for() {
@@ -257,6 +277,123 @@ cmd_renew_public_token() {
   echo -e "  ${DIM}bao token lookup \"\${BAO_TOKEN}\"${NC}"
 }
 
+# ─── CHECK APPROLE ────────────────────────────────────────
+# One login, any number of reads with that same token, then revoke-self. The token is
+# never printed and the secret ID never appears in a process argument (it travels on
+# stdin), so the check leaves no long-lived token behind.
+CHECK_TOKEN=""
+CHECK_ERRORS=""
+
+revoke_check_token() {
+  [[ -n "${CHECK_TOKEN}" ]] || return 0
+  local token="${CHECK_TOKEN}"
+  CHECK_TOKEN=""
+  BAO_TOKEN="${token}" bao token revoke -self &>/dev/null
+}
+
+cleanup_check() {
+  [[ -z "${CHECK_ERRORS}" ]] || rm -f "${CHECK_ERRORS}"
+  revoke_check_token || true
+}
+
+# Seconds, or Go-style durations such as 15m, 1h or 1h30m.
+valid_login_ttl() {
+  [[ "$1" =~ ^[0-9]+$ || "$1" =~ ^([0-9]+[smhd])+$ ]]
+}
+
+cmd_check_approle() {
+  banner; echo ""
+  label "  Check AppRole Login"
+  divider
+
+  local requested_ttl="${BAO_LOGIN_TTL:-}"
+  local -a reads=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --ttl)
+        [[ $# -ge 2 ]] || { error "--ttl needs a duration, e.g. 15m."; exit 1; }
+        requested_ttl="$2"
+        shift 2
+        ;;
+      --read)
+        [[ $# -ge 2 ]] || { error "--read needs a KV path, e.g. heylomeet/production/private."; exit 1; }
+        reads+=("$2")
+        shift 2
+        ;;
+      *)
+        error "Unknown option: $1"
+        exit 1
+        ;;
+    esac
+  done
+
+  if [[ -n "${requested_ttl}" ]] && ! valid_login_ttl "${requested_ttl}"; then
+    error "Invalid TTL '${requested_ttl}'. Use seconds or a duration such as 15m or 1h."
+    exit 1
+  fi
+
+  local role_id="${BAO_ROLE_ID:-}" secret_id="${BAO_SECRET_ID:-}"
+  if [[ -z "${role_id}" ]]; then ask "Role ID:" role_id; fi
+  if [[ -z "${secret_id}" ]]; then ask_secret "Secret ID:" secret_id; fi
+  if [[ ! "${role_id}" =~ ^[A-Za-z0-9._-]+$ || ! "${secret_id}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    error "Role ID and secret ID may only contain letters, digits, '.', '_' and '-'."
+    exit 1
+  fi
+
+  # `ttl` is optional. Servers that do not know it ignore it and answer with a warning.
+  local payload="{\"role_id\":\"${role_id}\",\"secret_id\":\"${secret_id}\""
+  if [[ -n "${requested_ttl}" ]]; then payload+=",\"ttl\":\"${requested_ttl}\""; fi
+  payload+="}"
+
+  local token
+  CHECK_ERRORS="$(mktemp)"
+  trap cleanup_check EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  # The admin token is not sent: this checks the role on its own.
+  if ! token="$(printf '%s' "${payload}" | env -u BAO_TOKEN -u VAULT_TOKEN \
+      bao write -field=token auth/approle/login - 2>"${CHECK_ERRORS}")" || [[ -z "${token}" ]]; then
+    error "AppRole login failed: check the credentials, the role, and that OpenBao is reachable."
+    exit 1
+  fi
+  CHECK_TOKEN="${token}"
+  success "Logged in. The token is not shown."
+
+  if [[ -n "${requested_ttl}" ]] && grep -qi 'unrecognized parameters.*ttl' "${CHECK_ERRORS}"; then
+    warn "This server ignored the requested TTL (older servers do); the role's token_ttl applies."
+  fi
+
+  local granted=""
+  granted="$(BAO_TOKEN="${CHECK_TOKEN}" bao token lookup -field=ttl 2>/dev/null)" || granted=""
+  info "Requested TTL : ${requested_ttl:-role default}"
+  if [[ -n "${granted}" ]]; then
+    info "Token TTL     : ${granted}s"
+  else
+    warn "Could not read the token TTL: the role's policy needs read on auth/token/lookup-self."
+  fi
+
+  local failed=0 path
+  for path in "${reads[@]+"${reads[@]}"}"; do
+    if BAO_TOKEN="${CHECK_TOKEN}" bao kv get "${path}" &>/dev/null; then
+      success "Read ${path} (values not shown)"
+    else
+      error "Cannot read ${path}"
+      failed=1
+    fi
+  done
+
+  if revoke_check_token; then
+    success "Token revoked with revoke-self."
+  else
+    warn "Could not revoke the token: the role's policy needs update on auth/token/revoke-self."
+    warn "It expires by itself${granted:+ in ${granted}s}."
+    failed=1
+  fi
+
+  return "${failed}"
+}
+
 # ─── SETUP ─────────────────────────────────────────────────
 cmd_setup() {
   banner; echo ""
@@ -306,6 +443,8 @@ cmd_setup() {
       ;;
   esac
 
+  info "Every login creates a token that OpenBao keeps until it expires. A short TTL (e.g. 1h)"
+  info "limits build-up when applications log in often; reuse the token and revoke it when done."
   ask "AppRole TTL for private access (e.g. 8760h, 0=infinite) [8760h]:" TOKEN_TTL_INPUT
   TOKEN_TTL="${TOKEN_TTL_INPUT:-8760h}"
 
@@ -476,6 +615,8 @@ path \"${MOUNT_PATH}/metadata/${PATH_PRIVATE}/*\" {
 "
     fi
 
+    priv_policy+="${TOKEN_SELF_POLICY}"
+
     info "Writing policy: ${priv_policy_name}…"
     echo "$priv_policy" | bao policy write "$priv_policy_name" - \
       && success "Policy '${priv_policy_name}' written."
@@ -629,6 +770,10 @@ case "$CMD" in
   revoke)
     require_server
     cmd_revoke
+    ;;
+  check-approle)
+    require_server
+    cmd_check_approle "$@"
     ;;
   help|--help|-h)
     show_help
