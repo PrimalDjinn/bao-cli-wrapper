@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# A stand-in for the bao CLI: records every call and answers from FAKE_* variables.
+# Calls go to $FAKE_BAO_DIR/calls.log, one line each, with the BAO_TOKEN the call used.
+set -u
+dir="${FAKE_BAO_DIR:?}"
+# Like the real CLI, fall back to the token `bao login` stored in ~/.vault-token.
+token="${BAO_TOKEN:-}"
+if [[ -z "$token" && -r "${HOME:-/nonexistent}/.vault-token" ]]; then token="$(cat "$HOME/.vault-token")"; fi
+printf 'CONFIG=%s TOKEN=%s TIMEOUT=%s RETRIES=%s HOME=%s ARGS=%s\n' \
+  "${BAO_CONFIG_PATH:-}${VAULT_CONFIG_PATH:-}" "$token" "${BAO_CLIENT_TIMEOUT:-}" "${BAO_MAX_RETRIES:-}" \
+  "${HOME:-}" "$*" >> "$dir/calls.log"
+
+case "${1:-} ${2:-}" in
+  "status "*) exit "${FAKE_STATUS_RC:-0}" ;;
+  "secrets list") echo '{"sys/": {}}' ;;
+  "auth list") echo '{"approle/": {}}' ;;
+  "policy write") cat > "$dir/policy-$3.hcl" ;;
+  "read -field=role_id") echo role-id-value ;;
+  "write -f") echo secret-id-value ;;
+  "write -field=token")
+    cat > "$dir/login.stdin"
+    [[ "${FAKE_LOGIN_FAIL:-}" == "1" ]] && { echo "invalid role or secret ID" >&2; exit 2; }
+    [[ "${FAKE_WARN_TTL:-}" == "1" ]] && echo "WARNING: Endpoint ignored these unrecognized parameters: [ttl]" >&2
+    echo "login-token-sentinel"
+    ;;
+  "token lookup") [[ "${FAKE_LOOKUP_FAIL:-}" == "1" ]] && exit 2; echo "${FAKE_TTL:-899}" ;;
+  "token revoke")
+    if [[ "${FAKE_BLOCK_REVOKE_ONCE:-}" == "1" && ! -e "$dir/revoke-blocked" ]]; then
+      # Hold the first revoke open and say which process group to signal.
+      touch "$dir/revoke-blocked"
+      ps -o pgid= -p $$ | tr -d ' ' > "$dir/blocked"
+      sleep 30
+    fi
+    if [[ "${FAKE_REVOKE_FAIL_ONCE:-}" == "1" && ! -e "$dir/revoke-failed" ]]; then
+      touch "$dir/revoke-failed"
+      exit 2
+    fi
+    [[ "${FAKE_REVOKE_FAIL:-}" == "1" ]] && exit 2
+    ;;
+  "kv get")
+    if [[ "${FAKE_BLOCK_READ:-}" == "1" ]]; then
+      # Hold the read open and say which process group to signal.
+      ps -o pgid= -p $$ | tr -d ' ' > "$dir/blocked"
+      sleep 30
+    fi
+    [[ "${FAKE_READ_FAIL:-}" == "1" ]] && exit 2
+    echo "secret-value-sentinel"
+    ;;
+esac
+exit 0
