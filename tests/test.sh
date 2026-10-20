@@ -262,6 +262,37 @@ else
   echo "skip - signal tests need perl"
 fi
 
+# --- AppRole credentials are verified on the target server before printing -----
+new_case; EXTRA_ENV=(FAKE_LOGIN_FAIL=1); run_script "demo\nstaging\n2\n\n\n\ny\n" setup
+check "setup stops without printing credentials the server rejects" \
+  "$([[ $rc -ne 0 ]] && output_has 'rejected the new AppRole credentials' && ! output_has 'secret-id-value' && echo 0 || echo 1)"
+EXTRA_ENV=()
+
+new_case; run_script "demo\nstaging\n2\n\n\n\ny\n" setup
+check "setup test-logs-in without an admin token or the secret in arguments, then revokes" \
+  "$([[ $rc -eq 0 ]] && has_call 'TOKEN= .*ARGS=write -field=token auth/approle/login -' && has_call 'TOKEN=login-token-sentinel .*ARGS=token revoke -self' && ! calls | grep -q 'ARGS=.*secret-id-value' && echo 0 || echo 1)"
+check "setup never prints the test login token" "$(! output_has 'login-token-sentinel' && echo 0 || echo 1)"
+
+new_case
+sed -i 's/^  "write -f") echo secret-id-value ;;$/  "write -f") exit 2 ;;/' "$FAKE_BAO_DIR/bin/bao"
+run_script "demo\nstaging\n2\n\n\n\ny\n" setup
+check "a failed secret ID is reported, not printed blank" \
+  "$([[ $rc -ne 0 ]] && output_has 'Could not create a secret ID' && ! output_has 'BAO_SECRET_ID' && echo 0 || echo 1)"
+
+# --- no silent localhost fallback ----------------------------------------------
+new_case; copy="$FAKE_BAO_DIR/copy"; mkdir -p "$copy"; cp "$ROOT/bao-setup-vault.sh" "$copy/"
+env -i HOME="$FAKE_BAO_DIR" PATH="$FAKE_BAO_DIR/bin:/usr/bin:/bin" FAKE_BAO_DIR="$FAKE_BAO_DIR" \
+  bash "$copy/bao-setup-vault.sh" list > "$out" 2>&1; rc=$?
+check "without BAO_ADDR or a .env the command stops before calling bao" \
+  "$([[ $rc -ne 0 ]] && output_has 'BAO_ADDR is not set' && [[ $(count_calls 'ARGS=') -eq 0 ]] && echo 0 || echo 1)"
+echo 'export BAO_ADDR=https://bao.example' > "$copy/.env"
+env -i HOME="$FAKE_BAO_DIR" PATH="$FAKE_BAO_DIR/bin:/usr/bin:/bin" FAKE_BAO_DIR="$FAKE_BAO_DIR" \
+  bash "$copy/bao-setup-vault.sh" list > "$out" 2>&1; rc=$?
+check "the .env next to the script supplies BAO_ADDR" "$([[ $rc -eq 0 ]] && output_has 'Loaded' && echo 0 || echo 1)"
+env -i HOME="$FAKE_BAO_DIR" PATH="$FAKE_BAO_DIR/bin:/usr/bin:/bin" FAKE_BAO_DIR="$FAKE_BAO_DIR" \
+  bash "$copy/bao-setup-vault.sh" help > "$out" 2>&1; rc=$?
+check "help still needs no address" "$([[ $rc -eq 0 ]] && output_has 'COMMANDS' && echo 0 || echo 1)"
+
 echo
 echo "$((total - failures))/$total passed"
 exit $((failures > 0))
