@@ -33,8 +33,25 @@ require_bao() {
     error "bao CLI not found. Install OpenBao first."
     exit 1
   fi
+  case "${1:-help}" in help|--help|-h) return 0 ;; esac
+
+  # Never fall back to the CLI's localhost default: credentials minted on the wrong
+  # server look valid but the real one rejects them. Use BAO_ADDR/VAULT_ADDR if set,
+  # else the .env next to this script (see .env.example).
   if [[ -z "${BAO_ADDR:-}" && -z "${VAULT_ADDR:-}" ]]; then
-    warn "BAO_ADDR / VAULT_ADDR not set. Using default http://127.0.0.1:8200"
+    local env_file
+    env_file="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/.env"
+    if [[ -f "${env_file}" ]]; then
+      set -a
+      # shellcheck disable=SC1090
+      source "${env_file}"
+      set +a
+      info "Loaded ${env_file}"
+    fi
+  fi
+  if [[ -z "${BAO_ADDR:-}" && -z "${VAULT_ADDR:-}" ]]; then
+    error "BAO_ADDR is not set. Export it or add it to .env (see .env.example)."
+    exit 1
   fi
 }
 
@@ -341,6 +358,24 @@ revoke_check_token() {
   [[ -n "${CHECK_TOKEN}" ]] || return 0
   BAO_TOKEN="${CHECK_TOKEN}" bao token revoke -self &>/dev/null || return 1
   CHECK_TOKEN=""
+}
+
+# Prove freshly issued credentials work on this server before printing them: log in
+# the same isolated way as check-approle (secret on stdin, no admin token, empty HOME),
+# then revoke that token.
+verify_new_approle() {
+  local token login_home
+  login_home="$(mktemp -d)"
+  if ! token="$(printf '{"role_id":"%s","secret_id":"%s"}' "$1" "$2" | env -u BAO_TOKEN -u VAULT_TOKEN \
+      -u BAO_CONFIG_PATH -u VAULT_CONFIG_PATH HOME="${login_home}" \
+      bao write -field=token auth/approle/login - 2>/dev/null)" || [[ -z "${token}" ]]; then
+    rm -rf "${login_home}"
+    error "The server rejected the new AppRole credentials; not printing them."
+    exit 1
+  fi
+  rm -rf "${login_home}"
+  BAO_TOKEN="${token}" bao token revoke -self &>/dev/null \
+    || warn "Could not revoke the test login token; it expires with the role's token TTL."
 }
 
 cleanup_check() {
@@ -728,19 +763,29 @@ path \"${MOUNT_PATH}/metadata/${PATH_PRIVATE}/*\" {
     if [[ "$TOKEN_TTL" != "0" ]]; then ttl_args+=("token_ttl=${TOKEN_TTL}"); fi
     if [[ "$TOKEN_MAX_TTL" != "0" ]]; then ttl_args+=("token_max_ttl=${TOKEN_MAX_TTL}"); fi
 
-    bao write auth/approle/role/"${role_name}" \
+    if ! bao write auth/approle/role/"${role_name}" \
       token_policies="${priv_policy_name}" \
       token_no_default_policy=true \
       token_renewable=true \
       ${ttl_args[@]+"${ttl_args[@]}"} \
       secret_id_num_uses=0 \
-      secret_id_ttl=0 &>/dev/null \
-      && success "AppRole '${role_name}' configured."
+      secret_id_ttl=0 >/dev/null; then
+      error "Could not configure AppRole '${role_name}'."
+      exit 1
+    fi
+    success "AppRole '${role_name}' configured."
 
-    # Fetch credentials
-    role_id=$(bao read -field=role_id auth/approle/role/"${role_name}/role-id" 2>/dev/null)
-    secret_id=$(bao write -f -field=secret_id auth/approle/role/"${role_name}/secret-id" 2>/dev/null)
-    success "AppRole credentials generated."
+    # Fetch credentials; any failure stops the run instead of printing blanks.
+    if ! role_id=$(bao read -field=role_id auth/approle/role/"${role_name}/role-id") || [[ -z "${role_id}" ]]; then
+      error "Could not read the role ID for '${role_name}'."
+      exit 1
+    fi
+    if ! secret_id=$(bao write -f -field=secret_id auth/approle/role/"${role_name}/secret-id") || [[ -z "${secret_id}" ]]; then
+      error "Could not create a secret ID for '${role_name}'."
+      exit 1
+    fi
+    verify_new_approle "${role_id}" "${secret_id}"
+    success "AppRole credentials generated and verified with a test login."
   fi
 
   # ── 4. Summary ──
@@ -843,7 +888,7 @@ path \"${MOUNT_PATH}/metadata/${PATH_PRIVATE}/*\" {
 }
 
 # ─── Entry point ──────────────────────────────────────────
-require_bao
+require_bao "${1:-help}"
 configure_client
 
 CMD="${1:-help}"

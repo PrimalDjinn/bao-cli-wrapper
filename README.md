@@ -12,7 +12,7 @@ It needs Bash and the `bao` CLI on `PATH`.
 
 | Command | Purpose |
 | --- | --- |
-| `setup` (alias `add-app`) | Interactive: mount, policies, public token and AppRole for an app. |
+| `setup` (alias `add-app`) | Interactive: mount, policies, public token and AppRole for an app. New AppRole credentials are printed only after a test login on the server succeeds. |
 | `list` | List the policies on the server. |
 | `renew-public-token [app env]` | Revoke and recreate an app's public token. |
 | `revoke` | Revoke a token by ID or accessor. |
@@ -29,7 +29,7 @@ source .env
 
 | Variable | Used by | Purpose |
 | --- | --- | --- |
-| `BAO_ADDR` | all | Server address. |
+| `BAO_ADDR` | all | Server address. If neither it nor `VAULT_ADDR` is exported, the `.env` next to the script is loaded; with no address at all the command stops (there is no localhost fallback). |
 | `BAO_TOKEN` | all but `check-approle` | Admin token for management commands. |
 | `BAO_CLIENT_TIMEOUT` | all | Seconds to wait for each request. Defaults to 40. |
 | `BAO_MAX_RETRIES` | all | Retries of 5xx responses. Defaults to 0. |
