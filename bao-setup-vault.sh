@@ -111,6 +111,8 @@ show_help() {
   echo -e "  ${Y}renew-public-token${NC}  Revoke and recreate a public token"
   echo -e "  ${Y}revoke${NC}              Revoke a token by accessor or token ID"
   echo -e "  ${Y}check-approle${NC}       Log in with an AppRole, optionally read, then revoke the token"
+  echo -e "  ${Y}unlock-role${NC}         Unlock a locked-out AppRole: <app> <environment> | --role <name>"
+  echo -e "  ${Y}locked-users${NC}        List AppRoles locked out by repeated failed logins"
   echo -e "  ${Y}help${NC}                Show this message"
   divider
   echo ""
@@ -127,6 +129,12 @@ show_help() {
   echo ""
   echo -e "  ${DIM}# Prove an AppRole works, with a 15 minute token, then revoke the token${NC}"
   echo -e "  ${C}./bao-setup.sh check-approle --ttl 15m --read heylomeet/production/private${NC}"
+  echo ""
+  echo -e "  ${DIM}# OpenBao locks an AppRole's role_id after repeated failed logins (default: 5 failures,${NC}"
+  echo -e "  ${DIM}# then 15 minutes); while locked every login returns 403, even with new valid credentials.${NC}"
+  echo -e "  ${DIM}# Setup unlocks a locked role before verifying new credentials. Apps must back off.${NC}"
+  echo -e "  ${C}./bao-setup.sh locked-users${NC}"
+  echo -e "  ${C}./bao-setup.sh unlock-role heylomeet production${NC}"
   echo ""
   echo -e "  ${W}${BOLD}ENVIRONMENT${NC}"
   echo -e "  ${Y}BAO_ADDR${NC}            OpenBao server address  (e.g. https://bao.example.com:8200)"
@@ -360,17 +368,104 @@ revoke_check_token() {
   CHECK_TOKEN=""
 }
 
+# ─── LOCKOUT ─────────────────────────────────────────────
+# OpenBao's user lockout (default for AppRole: 5 failed logins, then 15 minutes) locks the
+# role_id. While locked, every login returns 403, even with brand-new valid credentials.
+# The helpers below read sys/locked-users and sys/auth with plain text matching (no jq) and
+# never print role IDs, secret IDs or raw responses.
+LOCKOUT_ID_PATTERN='^[A-Za-z0-9._-]{1,128}$'
+LOCKOUT_NAME_PATTERN='^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$'
+
+# Prints the accessor of the approle auth mount. Fails when it cannot be found.
+approle_accessor() {
+  local mounts rest
+  mounts="$(bao auth list -format=json 2>/dev/null | tr -d '[:space:]')" || return 1
+  [[ "${mounts}" == *'"approle/":{'* ]] || return 1
+  rest="${mounts#*\"approle/\":\{}"
+  [[ "${rest}" =~ \"accessor\":\"([A-Za-z0-9_-]{1,128})\" ]] || return 1
+  printf '%s' "${BASH_REMATCH[1]}"
+}
+
+# Prints "mount_accessor<TAB>alias,alias,..." for every mount with locked users. The response
+# nests objects, but a mount entry holds only strings and string arrays, so the innermost
+# {...} objects are exactly the mount entries. Fails when the response is not understood.
+locked_mounts() {
+  local state obj ids accessor
+  state="$(bao read -format=json sys/locked-users 2>/dev/null | tr -d '[:space:]')" || return 1
+  [[ "${state}" == *'"by_namespace"'* ]] || return 1
+  while IFS= read -r obj; do
+    [[ "${obj}" =~ \"mount_accessor\":\"([A-Za-z0-9_-]{1,128})\" ]] || continue
+    accessor="${BASH_REMATCH[1]}"
+    [[ "${obj}" =~ \"alias_identifiers\":\[([^]]*)\] ]] || continue
+    ids="${BASH_REMATCH[1]//\"/}"
+    [[ -n "${ids}" ]] && printf '%s\t%s\n' "${accessor}" "${ids}"
+  done < <(printf '%s' "${state}" | grep -o '{[^{}]*}' || true)
+  return 0
+}
+
+# Unlocks the role_id when it is locked and prints "unlocked" or "not_locked". Returns 3 when
+# the lockout state cannot be read (nothing was changed) and 1 when a locked role could not
+# be unlocked. The mount lookup is skipped when the role_id is not locked on any mount.
+ensure_unlocked() {
+  local role_id="$1" mounts line mount_accessor ids accessor="" candidates=()
+  [[ "${role_id}" =~ ${LOCKOUT_ID_PATTERN} ]] || return 3
+  mounts="$(locked_mounts)" || return 3
+  while IFS=$'\t' read -r mount_accessor ids; do
+    [[ -n "${mount_accessor}" && ",${ids}," == *",${role_id},"* ]] && candidates+=("${mount_accessor}")
+  done <<< "${mounts}"
+  if [[ ${#candidates[@]} -eq 0 ]]; then
+    printf 'not_locked'
+    return 0
+  fi
+  accessor="$(approle_accessor)" || return 3
+  for line in "${candidates[@]}"; do
+    if [[ "${line}" == "${accessor}" ]]; then
+      bao write -f "sys/locked-users/${accessor}/unlock/${role_id}" &>/dev/null || return 1
+      printf 'unlocked'
+      return 0
+    fi
+  done
+  printf 'not_locked'
+}
+
+# Clears a lock before the verification login. A state that cannot be read is only a warning:
+# the login that follows still gates printing credentials. A lock that cannot be cleared stops
+# the run before anything is printed.
+unlock_if_locked() {
+  local role_id="$1" role_name="${2:-the role}" state="" rc=0
+  state="$(ensure_unlocked "${role_id}")" || rc=$?
+  case "${rc}:${state}" in
+    0:unlocked)
+      warn "Role '${role_name}' was locked out by repeated failed logins (likely an app using an old secret); unlocked."
+      warn "Update the app with the new secret promptly, or it will keep retrying the old one and lock the role again."
+      ;;
+    0:not_locked) ;;
+    3:*) warn "Could not check '${role_name}' for a lockout; continuing to the verification login." ;;
+    *)
+      error "Role '${role_name}' is locked out and could not be unlocked."
+      error "Unlock it with a token allowed to write sys/locked-users/<accessor>/unlock/<role_id>: ./bao-setup-vault.sh unlock-role --role ${role_name}"
+      exit 1
+      ;;
+  esac
+}
+
 # Prove freshly issued credentials work on this server before printing them: log in
 # the same isolated way as check-approle (secret on stdin, no admin token, empty HOME),
 # then revoke that token.
 verify_new_approle() {
-  local token login_home
+  local token login_home role_name="${3:-the role}" login_error=""
+  unlock_if_locked "$1" "${role_name}"
   login_home="$(mktemp -d)"
   if ! token="$(printf '{"role_id":"%s","secret_id":"%s"}' "$1" "$2" | env -u BAO_TOKEN -u VAULT_TOKEN \
       -u BAO_CONFIG_PATH -u VAULT_CONFIG_PATH HOME="${login_home}" \
-      bao write -field=token auth/approle/login - 2>/dev/null)" || [[ -z "${token}" ]]; then
+      bao write -field=token auth/approle/login - 2>"${login_home}/login-error")" || [[ -z "${token}" ]]; then
+    login_error="$(cat "${login_home}/login-error" 2>/dev/null || true)"
     rm -rf "${login_home}"
     error "The server rejected the new AppRole credentials; not printing them."
+    if [[ "${login_error}" == *"Code: 403"* ]]; then
+      error "Login returned 403 permission denied: '${role_name}' may be locked out again by an app still retrying with an old secret."
+      error "Update the app's secret first (or stop it), then rerun, or run: ./bao-setup-vault.sh unlock-role --role ${role_name}"
+    fi
     exit 1
   fi
   rm -rf "${login_home}"
@@ -515,6 +610,97 @@ cmd_check_approle() {
   fi
 
   return "${failed}"
+}
+
+# ─── LOCKOUT COMMANDS ────────────────────────────────────
+cmd_unlock_role() {
+  banner; echo ""
+  label "  Unlock AppRole"
+  divider
+
+  local role="" app="" env_name=""
+  case "$#" in
+    2)
+      if [[ "$1" == --role ]]; then role="$2"; else app="$1"; env_name="$2"; fi
+      ;;
+    *)
+      error "Usage: unlock-role <app> <environment> | --role <role-name>"
+      exit 1
+      ;;
+  esac
+  if [[ -z "${role}" ]]; then
+    [[ "${app}" =~ ${LOCKOUT_NAME_PATTERN} && "${env_name}" =~ ${LOCKOUT_NAME_PATTERN} ]] \
+      || { error "App and environment may only contain letters, digits, '.', '_' and '-'."; exit 1; }
+    role="${app}-${env_name}-backend"
+  fi
+  [[ "${role}" =~ ${LOCKOUT_NAME_PATTERN} ]] \
+    || { error "Role names may only contain letters, digits, '.', '_' and '-'."; exit 1; }
+
+  local role_id state="" rc=0
+  if ! role_id="$(bao read -field=role_id "auth/approle/role/${role}/role-id" 2>/dev/null)" || [[ -z "${role_id}" ]]; then
+    error "Could not read the role ID of '${role}'; check that the AppRole exists and the token may read it."
+    exit 1
+  fi
+  state="$(ensure_unlocked "${role_id}")" || rc=$?
+  case "${rc}:${state}" in
+    0:unlocked)
+      success "Role '${role}' was locked. Locked out by repeated failed logins (likely an app using an old secret); unlocked."
+      warn "Update the app with the new secret promptly: while it keeps retrying with the old one, the role will lock again."
+      ;;
+    0:not_locked) info "Role '${role}' is not locked; nothing to unlock." ;;
+    3:*)
+      error "Could not check for a lockout; the token needs read on sys/auth and sys/locked-users."
+      exit 1
+      ;;
+    *)
+      error "The server refused to unlock '${role}'; check that the token may write sys/locked-users/<accessor>/unlock/<role_id>."
+      exit 1
+      ;;
+  esac
+}
+
+cmd_locked_users() {
+  banner; echo ""
+  label "  Locked Users"
+  divider
+
+  local mounts accessor="" mount_accessor ids count name id found=0 names_ready=0
+  mounts="$(locked_mounts)" || {
+    error "Could not read sys/locked-users; the token needs read on it."
+    exit 1
+  }
+  if [[ -z "${mounts}" ]]; then
+    info "No locked users."
+    return 0
+  fi
+  accessor="$(approle_accessor)" || accessor=""
+
+  local -A role_names=()
+  while IFS=$'\t' read -r mount_accessor ids; do
+    [[ -n "${mount_accessor}" ]] || continue
+    count="$(printf '%s\n' "${ids}" | tr ',' '\n' | grep -c . || true)"
+    if [[ "${mount_accessor}" != "${accessor}" ]]; then
+      info "Mount ${mount_accessor} (not AppRole): ${count} locked"
+      continue
+    fi
+    if [[ "${names_ready}" == 0 ]]; then
+      local listed
+      listed="$(bao list -format=json auth/approle/role 2>/dev/null | grep -o '"[^"]*"' | tr -d '"' || true)"
+      while IFS= read -r name; do
+        [[ "${name}" =~ ${LOCKOUT_NAME_PATTERN} ]] || continue
+        id="$(bao read -field=role_id "auth/approle/role/${name}/role-id" 2>/dev/null)" || continue
+        [[ -n "${id}" && -z "${role_names[${id}]:-}" ]] && role_names["${id}"]="${name}"
+      done <<< "${listed}"
+      names_ready=1
+    fi
+    info "AppRole mount ${mount_accessor}: ${count} locked"
+    while IFS= read -r id; do
+      [[ -n "${id}" ]] || continue
+      echo -e "    role ${W}${role_names[${id}]:-(unknown or deleted role)}${NC}"
+      found=1
+    done < <(printf '%s\n' "${ids}" | tr ',' '\n')
+  done <<< "${mounts}"
+  [[ "${found}" == 0 ]] || info "Unlock with: ./bao-setup-vault.sh unlock-role <app> <environment>"
 }
 
 # ─── SETUP ─────────────────────────────────────────────────
@@ -784,7 +970,7 @@ path \"${MOUNT_PATH}/metadata/${PATH_PRIVATE}/*\" {
       error "Could not create a secret ID for '${role_name}'."
       exit 1
     fi
-    verify_new_approle "${role_id}" "${secret_id}"
+    verify_new_approle "${role_id}" "${secret_id}" "${role_name}"
     success "AppRole credentials generated and verified with a test login."
   fi
 
@@ -914,6 +1100,14 @@ case "$CMD" in
   check-approle)
     require_server
     cmd_check_approle "$@"
+    ;;
+  unlock-role)
+    require_server
+    cmd_unlock_role "$@"
+    ;;
+  locked-users)
+    require_server
+    cmd_locked_users
     ;;
   help|--help|-h)
     show_help

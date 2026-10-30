@@ -279,6 +279,85 @@ run_script "demo\nstaging\n2\n\n\n\ny\n" setup
 check "a failed secret ID is reported, not printed blank" \
   "$([[ $rc -ne 0 ]] && output_has 'Could not create a secret ID' && ! output_has 'BAO_SECRET_ID' && echo 0 || echo 1)"
 
+# --- a locked-out AppRole is unlocked before the verification login ---------------
+setup_input="demo\nstaging\n2\n\n\n\ny\n"
+login_index() { calls | grep -n 'ARGS=write -field=token auth/approle/login' | head -1 | cut -d: -f1; }
+call_index() { calls | grep -n -- "$1" | head -1 | cut -d: -f1; }
+
+new_case; EXTRA_ENV=(); run_script "$setup_input" setup
+check "an unlocked role is not touched: nothing locked, no mount lookup, no unlock" \
+  "$([[ $rc -eq 0 ]] && has_call 'ARGS=read -format=json sys/locked-users' && [[ $(count_calls 'ARGS=auth list') -eq 1 ]] && ! has_call 'unlock' && ! output_has 'locked out' && output_has 'BAO_SECRET_ID' && echo 0 || echo 1)"
+
+new_case; EXTRA_ENV=(FAKE_LOCKED=1); run_script "$setup_input" setup
+check "a locked role is unlocked at the approle accessor before the login, then setup succeeds" \
+  "$([[ $rc -eq 0 ]] && has_call 'ARGS=write -f sys/locked-users/auth_approle_fake01/unlock/role-id-value' && [[ $(call_index 'ARGS=write -f sys/locked-users') -lt $(login_index) ]] && echo 0 || echo 1)"
+check "the unlock says what happened and tells the operator to update the app" \
+  "$(output_has "Role 'demo-staging-backend' was locked out by repeated failed logins (likely an app using an old secret); unlocked." && output_has 'Update the app with the new secret promptly' && output_has 'secret-id-value' && echo 0 || echo 1)"
+check "the role ID never appears in the lockout messages" \
+  "$(! grep -i 'locked' "$out" | grep -q 'role-id-value' && echo 0 || echo 1)"
+
+new_case; EXTRA_ENV=(FAKE_LOCKED_OTHER=1); run_script "$setup_input" setup
+check "a user locked on another mount is ignored" \
+  "$([[ $rc -eq 0 ]] && ! has_call 'unlock' && ! output_has 'locked out' && echo 0 || echo 1)"
+
+new_case; EXTRA_ENV=(FAKE_LOCKED=1 FAKE_UNLOCK_FAIL=1); run_script "$setup_input" setup
+check "a role that cannot be unlocked stops setup before printing any credentials" \
+  "$([[ $rc -ne 0 ]] && output_has 'locked out and could not be unlocked' && output_has 'unlock-role --role demo-staging-backend' && ! output_has 'secret-id-value' && ! output_has 'BAO_SECRET_ID' && ! has_call 'approle/login' && echo 0 || echo 1)"
+
+new_case; EXTRA_ENV=(FAKE_LOCKED=1 FAKE_ACCESSOR_FAIL=1); run_script "$setup_input" setup
+check "a locked role whose mount accessor cannot be read warns and lets the login decide" \
+  "$([[ $rc -ne 0 ]] && output_has 'Could not check' && output_has 'may be locked out again' && ! output_has 'secret-id-value' && echo 0 || echo 1)"
+
+new_case; EXTRA_ENV=(FAKE_LOCKOUT_READ_FAIL=1); run_script "$setup_input" setup
+check "an unreadable lockout state warns and continues to the verification login" \
+  "$([[ $rc -eq 0 ]] && output_has "Could not check 'demo-staging-backend' for a lockout" && has_call 'approle/login' && output_has 'secret-id-value' && echo 0 || echo 1)"
+
+new_case; EXTRA_ENV=(FAKE_LOGIN_403=1); run_script "$setup_input" setup
+check "a 403 on the verification login explains that an app may have re-locked the role" \
+  "$([[ $rc -ne 0 ]] && output_has 'rejected the new AppRole credentials' && output_has 'may be locked out again by an app still retrying with an old secret' && output_has 'unlock-role --role demo-staging-backend' && ! output_has 'secret-id-value' && echo 0 || echo 1)"
+
+new_case; EXTRA_ENV=(FAKE_LOGIN_FAIL=1); run_script "$setup_input" setup
+check "a plain wrong-secret rejection does not claim a lockout" "$([[ $rc -ne 0 ]] && ! output_has 'locked out again' && echo 0 || echo 1)"
+
+# --- locked-users ----------------------------------------------------------------
+new_case; EXTRA_ENV=(); run_script "" locked-users
+check "locked-users reports when nobody is locked" "$([[ $rc -eq 0 ]] && output_has 'No locked users' && ! has_call 'auth list' && echo 0 || echo 1)"
+
+new_case; EXTRA_ENV=(FAKE_LOCKED=1 FAKE_LOCKED_OTHER=1); run_script "" locked-users
+check "locked-users lists locked AppRoles by name and counts other mounts" \
+  "$([[ $rc -eq 0 ]] && output_has 'role.*demo-staging-backend' && output_has '(unknown or deleted role)' && output_has 'AppRole mount .*: 2 locked' && output_has '(not AppRole): 1 locked' && ! output_has 'other-role' && ! output_has 'role-id-value' && ! output_has 'deleted-role-id' && ! output_has 'someone' && echo 0 || echo 1)"
+
+new_case; EXTRA_ENV=(FAKE_LOCKOUT_READ_FAIL=1); run_script "" locked-users
+check "locked-users fails clearly when the state cannot be read" "$([[ $rc -ne 0 ]] && output_has 'Could not read sys/locked-users' && echo 0 || echo 1)"
+
+# --- unlock-role -----------------------------------------------------------------
+new_case; EXTRA_ENV=(FAKE_LOCKED=1); run_script "" unlock-role demo staging
+check "unlock-role <app> <env> unlocks <app>-<env>-backend" \
+  "$([[ $rc -eq 0 ]] && has_call 'ARGS=read -field=role_id auth/approle/role/demo-staging-backend/role-id' && has_call 'ARGS=write -f sys/locked-users/auth_approle_fake01/unlock/role-id-value' && output_has 'was locked' && output_has 'Update the app with the new secret promptly' && ! output_has 'role-id-value' && echo 0 || echo 1)"
+
+new_case; EXTRA_ENV=(FAKE_LOCKED=1); run_script "" unlock-role --role demo-staging-backend
+check "unlock-role --role unlocks that exact role" \
+  "$([[ $rc -eq 0 ]] && has_call 'auth/approle/role/demo-staging-backend/role-id' && has_call 'unlock/role-id-value' && echo 0 || echo 1)"
+
+new_case; EXTRA_ENV=(); run_script "" unlock-role demo staging
+check "unlock-role on an unlocked role says so and unlocks nothing" "$([[ $rc -eq 0 ]] && output_has 'is not locked' && ! has_call 'unlock/' && echo 0 || echo 1)"
+
+new_case; EXTRA_ENV=(FAKE_LOCKED=1 FAKE_UNLOCK_FAIL=1); run_script "" unlock-role demo staging
+check "unlock-role fails when the server refuses to unlock" "$([[ $rc -ne 0 ]] && output_has 'refused to unlock' && echo 0 || echo 1)"
+
+new_case; EXTRA_ENV=(); run_script "" unlock-role --role missing-role
+check "unlock-role fails when the role does not exist" "$([[ $rc -ne 0 ]] && output_has 'Could not read the role ID' && ! has_call 'sys/locked-users' && echo 0 || echo 1)"
+
+new_case; EXTRA_ENV=(FAKE_LOCKOUT_READ_FAIL=1); run_script "" unlock-role demo staging
+check "unlock-role fails when the lockout state cannot be read" "$([[ $rc -ne 0 ]] && output_has 'Could not check for a lockout' && echo 0 || echo 1)"
+
+new_case; EXTRA_ENV=(); run_script "" unlock-role demo
+check "unlock-role needs both an app and an environment" "$([[ $rc -ne 0 ]] && output_has 'Usage: unlock-role' && ! has_call 'ARGS=read' && echo 0 || echo 1)"
+
+new_case; EXTRA_ENV=(); run_script "" unlock-role --role '../sys'
+check "unlock-role rejects a role name that could change the API path" "$([[ $rc -ne 0 ]] && output_has 'Role names may only contain' && ! has_call 'ARGS=read -field' && echo 0 || echo 1)"
+EXTRA_ENV=()
+
 # --- no silent localhost fallback ----------------------------------------------
 new_case; copy="$FAKE_BAO_DIR/copy"; mkdir -p "$copy"; cp "$ROOT/bao-setup-vault.sh" "$copy/"
 env -i HOME="$FAKE_BAO_DIR" PATH="$FAKE_BAO_DIR/bin:/usr/bin:/bin" FAKE_BAO_DIR="$FAKE_BAO_DIR" \
