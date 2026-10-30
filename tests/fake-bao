@@ -10,15 +10,56 @@ printf 'CONFIG=%s TOKEN=%s TIMEOUT=%s RETRIES=%s HOME=%s ARGS=%s\n' \
   "${BAO_CONFIG_PATH:-}${VAULT_CONFIG_PATH:-}" "$token" "${BAO_CLIENT_TIMEOUT:-}" "${BAO_MAX_RETRIES:-}" \
   "${HOME:-}" "$*" >> "$dir/calls.log"
 
+# Lockout state. FAKE_LOCKED=1 locks "role-id-value" (every role but "other-role") on the approle
+# mount until it is unlocked; FAKE_LOCKED_OTHER=1 also locks a role on another mount;
+# FAKE_LOCKOUT_READ_FAIL, FAKE_ACCESSOR_FAIL and FAKE_UNLOCK_FAIL fail that step; FAKE_RELOCK=1
+# makes the login answer 403 even after an unlock.
+accessor="auth_approle_fake01"
+if [[ "${1:-}" == write && "${2:-}" == -f && "${3:-}" == sys/locked-users/* ]]; then
+  [[ "${FAKE_UNLOCK_FAIL:-}" == "1" ]] && { echo "Error writing data: permission denied" >&2; exit 2; }
+  [[ "$3" == "sys/locked-users/$accessor/unlock/role-id-value" ]] || exit 2
+  touch "$dir/unlocked"
+  exit 0
+fi
+
 case "${1:-} ${2:-}" in
+  "read -format=json")
+    [[ "$3" == sys/locked-users ]] || exit 0
+    [[ "${FAKE_LOCKOUT_READ_FAIL:-}" == "1" ]] && { echo "permission denied" >&2; exit 2; }
+    mounts=""
+    if [[ "${FAKE_LOCKED:-}" == "1" && ! -e "$dir/unlocked" ]]; then
+      mounts='{"alias_identifiers": ["role-id-value", "deleted-role-id"], "counts": 2, "mount_accessor": "'"$accessor"'"}'
+    fi
+    if [[ "${FAKE_LOCKED_OTHER:-}" == "1" ]]; then
+      [[ -z "$mounts" ]] || mounts+=","
+      mounts+='{"alias_identifiers": ["someone"], "counts": 1, "mount_accessor": "auth_userpass_fake02"}'
+    fi
+    if [[ -n "$mounts" ]]; then
+      printf '{\n  "data": {\n    "by_namespace": [\n      {\n        "counts": 1,\n        "mount_accessors": [\n%s\n        ],\n        "namespace_id": "root",\n        "namespace_path": "root/"\n      }\n    ],\n    "total_counts": 1\n  }\n}\n' "$mounts"
+    else
+      echo '{"data": {"by_namespace": [], "total_counts": 0}}'
+    fi
+    ;;
+  "list -format=json") echo '["demo-staging-backend", "other-role"]' ;;
   "status "*) exit "${FAKE_STATUS_RC:-0}" ;;
   "secrets list") echo '{"sys/": {}}' ;;
-  "auth list") echo '{"approle/": {}}' ;;
+  "auth list")
+    [[ "${FAKE_ACCESSOR_FAIL:-}" == "1" ]] && exit 2
+    echo '{"approle/": {"accessor": "'"$accessor"'", "config": {"default_lease_ttl": 0}, "type": "approle"}}'
+    ;;
   "policy write") cat > "$dir/policy-$3.hcl" ;;
-  "read -field=role_id") echo role-id-value ;;
+  "read -field=role_id")
+    case "$3" in
+      *missing-role*) exit 2 ;;
+      *other-role*) echo other-role-id ;;
+      *) echo role-id-value ;;
+    esac
+    ;;
   "write -f") echo secret-id-value ;;
   "write -field=token")
     cat > "$dir/login.stdin"
+    [[ "${FAKE_LOCKED:-}" == "1" && ! -e "$dir/unlocked" ]] && FAKE_LOGIN_403=1
+    [[ "${FAKE_LOGIN_403:-}" == "1" ]] && { printf 'Error writing data to auth/approle/login: Error making API request.\n\nCode: 403. Errors:\n\n* permission denied\n' >&2; exit 2; }
     [[ "${FAKE_LOGIN_FAIL:-}" == "1" ]] && { echo "invalid role or secret ID" >&2; exit 2; }
     [[ "${FAKE_WARN_TTL:-}" == "1" ]] && echo "WARNING: Endpoint ignored these unrecognized parameters: [ttl]" >&2
     echo "login-token-sentinel"

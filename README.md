@@ -17,6 +17,8 @@ It needs Bash and the `bao` CLI on `PATH`.
 | `renew-public-token [app env]` | Revoke and recreate an app's public token. |
 | `revoke` | Revoke a token by ID or accessor. |
 | `check-approle [--ttl 15m] [--read PATH]... [--secret-id-file FILE]` | Log in with an AppRole, read, then revoke the token. |
+| `unlock-role <app> <env>` or `unlock-role --role NAME` | Unlock an AppRole locked out by repeated failed logins. |
+| `locked-users` | List the AppRoles that are locked out, by name. |
 | `help` | Show usage. |
 
 ```sh
@@ -149,6 +151,48 @@ have the two paths: add them with `bao policy read` and `bao policy write`. Do n
 `_type` to the same KV path the application reads, which replaces the current secret version
 (KV v2 keeps the previous version, and `bao kv rollback` restores it).
 
+## Lockout
+
+OpenBao's user lockout is on by default for AppRole (also userpass and LDAP). After repeated
+failed logins it locks the alias, which for AppRole is the `role_id`. With the defaults, 5
+failed logins lock the role for 15 minutes (`lockout_threshold=5`, `lockout_duration=15m`; the
+failure counter resets after `lockout_counter_reset=15m`). A locked role answers **every**
+login with `403 permission denied`, even with brand-new valid credentials, whereas a plain
+wrong secret answers `400 invalid role or secret ID`. So an app that keeps retrying with an old
+secret after you re-issued credentials keeps the role locked, and the new credentials appear
+not to work. An app that retries every couple of seconds trips the threshold again within
+seconds of each unlock.
+
+`setup` handles this for you. After it configures the role and issues a new SecretID, and
+before the verification login, it reads `sys/locked-users`. If the role's `role_id` is locked,
+it looks up the `approle` mount accessor in `sys/auth`, unlocks the role with
+`sys/locked-users/<accessor>/unlock/<role_id>` and prints that the role was locked out by
+repeated failed logins. **Update the app with the new secret promptly**; while it still sends
+the old one, the role locks again. If verification still returns 403 after the unlock, `setup`
+says so: an app may have re-locked the role. Update that app's secret first (or stop it), then
+rerun. If the lockout state cannot be read, `setup` warns and carries on; the verification
+login still gates printing credentials. If a locked role cannot be unlocked, `setup` stops
+before printing anything.
+
+```sh
+./bao-setup-vault.sh locked-users                       # which roles are locked, by name
+./bao-setup-vault.sh unlock-role heylomeet production   # unlocks heylomeet-production-backend
+./bao-setup-vault.sh unlock-role --role <role-name>     # any AppRole by its exact name
+```
+
+`unlock-role` says whether the role was locked and unlocks it; `locked-users` maps locked
+`role_id`s back to role names. Neither prints role IDs, SecretIDs, tokens or raw responses. The
+admin token needs `read` on `sys/auth` and `sys/locked-users`, `update` on
+`sys/locked-users/+/unlock/+`, and `read` on `auth/approle/role/*/role-id` (plus `list` on
+`auth/approle/role` for `locked-users`). To see the raw state yourself, run
+`bao read sys/locked-users`. To tune the policy, see `bao auth tune approle/` with the
+`-user-lockout-*` flags and the [user lockout](https://openbao.org/docs/concepts/user-lockout/)
+documentation.
+
+Applications must back off when a login is rejected: stop or wait (exponential backoff with a
+long cap, well beyond the 15-minute lock) instead of retrying on a short timer, and never retry
+the same rejected secret in a loop.
+
 ## Tests
 
 ```sh
@@ -156,6 +200,7 @@ bash tests/test.sh
 ```
 
 The tests run the script against a fake `bao` that records every call, so they need no server.
-They cover the client defaults, the status check, the generated policies, and `check-approle`
+They cover the client defaults, the status check, the generated policies, `check-approle`
 (login payload, token reuse, revoke-self on success and on failure, and that no secret reaches
-a process argument or the output).
+a process argument or the output), and the lockout handling (nothing locked, locked then
+unlocked, unlock failure, unreadable state, `locked-users` and `unlock-role`).
