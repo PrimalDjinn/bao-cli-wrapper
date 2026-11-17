@@ -22,6 +22,13 @@ if [[ "${1:-}" == write && "${2:-}" == -f && "${3:-}" == sys/locked-users/* ]]; 
   exit 0
 fi
 
+if [[ "${1:-}" == write && "${2:-}" == */secret-id-accessor/destroy ]]; then
+  [[ "${FAKE_DESTROY_FAIL:-}" == "1" ]] && exit 2
+  grep -vxF -- "${3#secret_id_accessor=}" "$dir/accessors" > "$dir/accessors.new" || true
+  mv "$dir/accessors.new" "$dir/accessors"
+  exit 0
+fi
+
 case "${1:-} ${2:-}" in
   "read -format=json")
     [[ "$3" == sys/locked-users ]] || exit 0
@@ -40,7 +47,23 @@ case "${1:-} ${2:-}" in
       echo '{"data": {"by_namespace": [], "total_counts": 0}}'
     fi
     ;;
-  "list -format=json") echo '["demo-staging-backend", "other-role"]' ;;
+  "list -format=json")
+    if [[ "$3" == */secret-id ]]; then
+      # SecretID accessors live in $dir/accessors, one per line; none means "No value found".
+      [[ "${FAKE_LIST_FAIL:-}" == "1" ]] && { echo "permission denied" >&2; exit 2; }
+      if [[ ! -s "$dir/accessors" ]]; then echo "No value found at $3" >&2; exit 2; fi
+      printf '['; sed 's/.*/"&"/' "$dir/accessors" | paste -sd, - | tr -d '\n'; printf ']\n'
+    else
+      echo '["demo-staging-backend", "other-role"]'
+    fi
+    ;;
+  "write -format=json")
+    # rotate-secret-id: issue a SecretID with the next accessor.
+    [[ "${FAKE_ISSUE_FAIL:-}" == "1" ]] && exit 2
+    n=$(( $(wc -l < "$dir/accessors" 2>/dev/null || echo 0) + 1 ))
+    echo "accessor-new-$n" >> "$dir/accessors"
+    printf '{\n  "data": {\n    "secret_id": "new-secret-id-sentinel",\n    "secret_id_accessor": "accessor-new-%s",\n    "secret_id_num_uses": 0,\n    "secret_id_ttl": 0\n  }\n}\n' "$n"
+    ;;
   "status "*) exit "${FAKE_STATUS_RC:-0}" ;;
   "secrets list") echo '{"sys/": {}}' ;;
   "auth list")

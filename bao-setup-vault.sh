@@ -113,6 +113,8 @@ show_help() {
   echo -e "  ${Y}check-approle${NC}       Log in with an AppRole, optionally read, then revoke the token"
   echo -e "  ${Y}unlock-role${NC}         Unlock a locked-out AppRole: <app> <environment> | --role <name>"
   echo -e "  ${Y}locked-users${NC}        List AppRoles locked out by repeated failed logins"
+  echo -e "  ${Y}rotate-secret-id${NC}    Issue and verify a new SecretID: <app> <environment> | --role <name>"
+  echo -e "  ${Y}prune-secret-ids${NC}    Destroy a role's other SecretIDs: ... --keep <accessor>"
   echo -e "  ${Y}help${NC}                Show this message"
   divider
   echo ""
@@ -135,6 +137,10 @@ show_help() {
   echo -e "  ${DIM}# Setup unlocks a locked role before verifying new credentials. Apps must back off.${NC}"
   echo -e "  ${C}./bao-setup.sh locked-users${NC}"
   echo -e "  ${C}./bao-setup.sh unlock-role heylomeet production${NC}"
+  echo ""
+  echo -e "  ${DIM}# Rotate a SecretID: issue one (old ones keep working), bind it, then prune the rest${NC}"
+  echo -e "  ${C}./bao-setup.sh rotate-secret-id --role heylomeet-production-backend --credentials-dir ~/secure/rot-1${NC}"
+  echo -e "  ${C}./bao-setup.sh prune-secret-ids --role heylomeet-production-backend --keep <new accessor>${NC}"
   echo ""
   echo -e "  ${W}${BOLD}ENVIRONMENT${NC}"
   echo -e "  ${Y}BAO_ADDR${NC}            OpenBao server address  (e.g. https://bao.example.com:8200)"
@@ -453,6 +459,20 @@ unlock_if_locked() {
 # the same isolated way as check-approle (secret on stdin, no admin token, empty HOME),
 # then revoke that token.
 verify_new_approle() {
+  local role_name="${3:-the role}" rc=0
+  try_new_approle "$1" "$2" "${role_name}" || rc=$?
+  [[ "${rc}" == 0 ]] && return 0
+  error "The server rejected the new AppRole credentials; not printing them."
+  if [[ "${rc}" == 2 ]]; then
+    error "Login returned 403 permission denied: '${role_name}' may be locked out again by an app still retrying with an old secret."
+    error "Update the app's secret first (or stop it), then rerun, or run: ./bao-setup-vault.sh unlock-role --role ${role_name}"
+  fi
+  exit 1
+}
+
+# Unlocks the role if needed, then logs in once with the new pair and revokes that token.
+# Returns 0 when the login worked, 2 when it answered 403 and 1 for any other rejection.
+try_new_approle() {
   local token login_home role_name="${3:-the role}" login_error=""
   unlock_if_locked "$1" "${role_name}"
   login_home="$(mktemp -d)"
@@ -461,16 +481,13 @@ verify_new_approle() {
       bao write -field=token auth/approle/login - 2>"${login_home}/login-error")" || [[ -z "${token}" ]]; then
     login_error="$(cat "${login_home}/login-error" 2>/dev/null || true)"
     rm -rf "${login_home}"
-    error "The server rejected the new AppRole credentials; not printing them."
-    if [[ "${login_error}" == *"Code: 403"* ]]; then
-      error "Login returned 403 permission denied: '${role_name}' may be locked out again by an app still retrying with an old secret."
-      error "Update the app's secret first (or stop it), then rerun, or run: ./bao-setup-vault.sh unlock-role --role ${role_name}"
-    fi
-    exit 1
+    [[ "${login_error}" == *"Code: 403"* ]] && return 2
+    return 1
   fi
   rm -rf "${login_home}"
   BAO_TOKEN="${token}" bao token revoke -self &>/dev/null \
     || warn "Could not revoke the test login token; it expires with the role's token TTL."
+  return 0
 }
 
 cleanup_check() {
@@ -701,6 +718,225 @@ cmd_locked_users() {
     done < <(printf '%s\n' "${ids}" | tr ',' '\n')
   done <<< "${mounts}"
   [[ "${found}" == 0 ]] || info "Unlock with: ./bao-setup-vault.sh unlock-role <app> <environment>"
+}
+
+# ─── SECRETID ROTATION ───────────────────────────────────
+# rotate-secret-id issues a new SecretID for an existing AppRole and proves it with one login;
+# the role, its policies, its RoleID and its other SecretIDs are left as they are, so the app
+# keeps working until it is switched over. prune-secret-ids then destroys the other SecretIDs.
+# Accessors are not secrets and are shown so the prune step can name the one to keep.
+
+# Parses "<app> <environment> | --role <name>" plus the options a command allows, into
+# TARGET_ROLE, TARGET_ARGS (the same words, for printing the next command), OPT_DIR, OPT_KEEP
+# and OPT_YES. The first argument is the usage line; the second lists the allowed options.
+parse_role_target() {
+  local usage="$1" allowed="$2" role="" app="" env_name="" word
+  local -a positional=()
+  shift 2
+  OPT_DIR="" OPT_KEEP="" OPT_YES=0
+  while [[ $# -gt 0 ]]; do
+    word="$1"
+    case "${word}" in
+      --role|--credentials-dir|--keep)
+        [[ " ${allowed} " == *" ${word} "* && $# -ge 2 ]] || { error "Usage: ${usage}"; exit 1; }
+        case "${word}" in
+          --role) role="$2" ;;
+          --credentials-dir) OPT_DIR="$2" ;;
+          --keep) OPT_KEEP="$2" ;;
+        esac
+        shift 2
+        ;;
+      --yes)
+        [[ " ${allowed} " == *" --yes "* ]] || { error "Usage: ${usage}"; exit 1; }
+        OPT_YES=1
+        shift
+        ;;
+      -*) error "Usage: ${usage}"; exit 1 ;;
+      *) positional+=("${word}"); shift ;;
+    esac
+  done
+  if [[ -n "${role}" && ${#positional[@]} -eq 0 ]]; then
+    TARGET_ARGS="--role ${role}"
+  elif [[ -z "${role}" && ${#positional[@]} -eq 2 ]]; then
+    app="${positional[0]}" env_name="${positional[1]}"
+    [[ "${app}" =~ ${LOCKOUT_NAME_PATTERN} && "${env_name}" =~ ${LOCKOUT_NAME_PATTERN} ]] \
+      || { error "App and environment may only contain letters, digits, '.', '_' and '-'."; exit 1; }
+    role="${app}-${env_name}-backend"
+    TARGET_ARGS="${app} ${env_name}"
+  else
+    error "Usage: ${usage}"
+    exit 1
+  fi
+  [[ "${role}" =~ ${LOCKOUT_NAME_PATTERN} ]] \
+    || { error "Role names may only contain letters, digits, '.', '_' and '-'."; exit 1; }
+  TARGET_ROLE="${role}"
+}
+
+# Prints the role's SecretID accessors, one per line (nothing when it has none). Fails when the
+# list cannot be read or holds anything but plain identifiers.
+secret_id_accessors() {
+  local listed rc=0 errors item
+  errors="$(mktemp)"
+  listed="$(bao list -format=json "auth/approle/role/$1/secret-id" 2>"${errors}")" || rc=$?
+  if [[ "${rc}" != 0 ]]; then
+    # An empty list is reported as "No value found", not as an empty array.
+    if grep -q '^No value found at' "${errors}"; then rm -f "${errors}"; return 0; fi
+    rm -f "${errors}"
+    return 1
+  fi
+  rm -f "${errors}"
+  listed="$(printf '%s' "${listed}" | tr -d '[:space:]')"
+  [[ "${listed}" =~ ^\[(\"[A-Za-z0-9._-]{1,128}\"(,\"[A-Za-z0-9._-]{1,128}\")*)?\]$ ]] || return 1
+  listed="${listed#[}" listed="${listed%]}"
+  [[ -n "${listed}" ]] || return 0
+  while IFS= read -r item; do printf '%s\n' "${item//\"/}"; done < <(printf '%s\n' "${listed}" | tr ',' '\n')
+}
+
+# A directory for the credential file: owner-only, not a symlink, not inside a Git work tree.
+check_credentials_dir() {
+  local dir="$1" mode probe
+  if [[ -e "${dir}" || -L "${dir}" ]]; then
+    if [[ ! -d "${dir}" || -L "${dir}" ]]; then
+      error "The credentials directory must be a directory, not a symlink or file."; return 1
+    fi
+    mode="$(stat -c '%a' "${dir}" 2>/dev/null || stat -f '%Lp' "${dir}" 2>/dev/null || true)"
+    if [[ -z "${mode}" || "${mode: -2}" != "00" || ! -O "${dir}" ]]; then
+      error "The credentials directory must be yours and not accessible to group or others (chmod 700)."; return 1
+    fi
+    probe="${dir}"
+  else
+    probe="$(dirname -- "${dir}")"
+    [[ -d "${probe}" ]] || { error "The credentials directory's parent must already exist."; return 1; }
+  fi
+  if command -v git &>/dev/null && git -C "${probe}" rev-parse --is-inside-work-tree &>/dev/null; then
+    error "Keep credential files outside Git work trees."; return 1
+  fi
+}
+
+cmd_rotate_secret_id() {
+  banner; echo ""
+  label "  Rotate AppRole SecretID"
+  divider
+  local usage="rotate-secret-id <app> <environment> | --role <role-name> [--credentials-dir <dir>]"
+  parse_role_target "${usage}" "--role --credentials-dir" "$@"
+  local role="${TARGET_ROLE}" dir="${OPT_DIR}" target=""
+  if [[ -n "${dir}" ]]; then
+    check_credentials_dir "${dir}" || exit 1
+    target="${dir%/}/${role}.json"
+    if [[ -e "${target}" || -L "${target}" ]]; then
+      error "${role}.json already exists in ${dir}; it is not replaced. Use a new directory for each rotation."
+      exit 1
+    fi
+  fi
+
+  local role_id previous issued secret_id accessor ttl rc=0
+  if ! role_id="$(bao read -field=role_id "auth/approle/role/${role}/role-id" 2>/dev/null)" \
+      || [[ ! "${role_id}" =~ ${LOCKOUT_ID_PATTERN} ]]; then
+    error "Could not read the role ID of '${role}'; check that the AppRole exists and the token may read it."
+    exit 1
+  fi
+  previous="$(secret_id_accessors "${role}")" || {
+    error "Could not list the SecretIDs of '${role}'; the token needs list on auth/approle/role/${role}/secret-id."
+    exit 1
+  }
+
+  issued="$(bao write -format=json -f "auth/approle/role/${role}/secret-id" 2>/dev/null | tr -d '[:space:]')" || issued=""
+  [[ "${issued}" =~ \"secret_id\":\"([A-Za-z0-9._-]{1,256})\" ]] && secret_id="${BASH_REMATCH[1]}" || secret_id=""
+  [[ "${issued}" =~ \"secret_id_accessor\":\"([A-Za-z0-9._-]{1,128})\" ]] && accessor="${BASH_REMATCH[1]}" || accessor=""
+  [[ "${issued}" =~ \"secret_id_ttl\":([0-9]{1,12}) ]] && ttl="${BASH_REMATCH[1]}" || ttl=0
+  issued=""
+  if [[ -z "${secret_id}" || -z "${accessor}" ]]; then
+    error "Could not create a SecretID for '${role}' (or the response was not understood)."
+    exit 1
+  fi
+
+  try_new_approle "${role_id}" "${secret_id}" "${role}" || rc=$?
+  if [[ "${rc}" != 0 ]]; then
+    secret_id=""
+    if bao write "auth/approle/role/${role}/secret-id-accessor/destroy" "secret_id_accessor=${accessor}" &>/dev/null; then
+      error "The new SecretID for '${role}' was rejected at login; it was destroyed. Existing SecretIDs are unchanged."
+    else
+      error "The new SecretID for '${role}' was rejected at login, and destroying it failed: destroy accessor ${accessor} manually."
+    fi
+    [[ "${rc}" == 2 ]] && error "Login returned 403: an app retrying with an old secret may have re-locked the role."
+    exit 1
+  fi
+
+  success "New SecretID for '${role}' issued and verified with a test login."
+  info "Accessor : ${accessor}  (identifies it for prune-secret-ids; not a credential, never bind it)"
+  if [[ "${ttl}" == 0 ]]; then info "Expires  : never"; else info "Expires  : in ${ttl}s"; fi
+  info "Previous : $(printf '%s' "${previous}" | grep -c . || true) SecretID(s) still valid"
+
+  if [[ -n "${target}" ]]; then
+    local tmp
+    ( umask 077; mkdir -p -- "${dir}" ) || { error "Could not create ${dir}."; exit 1; }
+    tmp="$(umask 077; mktemp "${dir%/}/.bao-credential-XXXXXX")" || { error "Could not write to ${dir}."; exit 1; }
+    printf '{"role":"%s","role_id":"%s","secret_id":"%s","accessor":"%s"}\n' \
+      "${role}" "${role_id}" "${secret_id}" "${accessor}" > "${tmp}"
+    # ln refuses to replace a file that appeared in the meantime.
+    if ! ln -- "${tmp}" "${target}" 2>/dev/null; then
+      error "Could not publish ${target}; the new SecretID remains in the protected file ${tmp}."
+      exit 1
+    fi
+    rm -f -- "${tmp}"
+    success "Saved to ${target} (mode 600). Bind role_id and secret_id; the role_id is unchanged."
+  else
+    echo ""
+    warn "AppRole credentials shown ONCE. Bind both values; the role ID is unchanged:"
+    echo -e "  ${DIM}export BAO_ROLE_ID=${role_id}${NC}"
+    echo -e "  ${DIM}export BAO_SECRET_ID=${secret_id}${NC}"
+  fi
+  secret_id=""
+  echo ""
+  info "Bind the new SecretID, confirm the app works, then remove the old ones:"
+  echo -e "  ${C}./bao-setup-vault.sh prune-secret-ids ${TARGET_ARGS} --keep ${accessor}${NC}"
+}
+
+cmd_prune_secret_ids() {
+  banner; echo ""
+  label "  Prune AppRole SecretIDs"
+  divider
+  local usage="prune-secret-ids <app> <environment> | --role <role-name> --keep <accessor> [--yes]"
+  parse_role_target "${usage}" "--role --keep --yes" "$@"
+  local role="${TARGET_ROLE}" keep="${OPT_KEEP}" current accessor failed=0
+  local -a doomed=()
+  [[ "${keep}" =~ ^[A-Za-z0-9._-]{1,128}$ ]] || { error "Usage: ${usage}"; exit 1; }
+  if ! bao read -field=role_id "auth/approle/role/${role}/role-id" &>/dev/null; then
+    error "Could not read the role ID of '${role}'; check that the AppRole exists and the token may read it."
+    exit 1
+  fi
+  current="$(secret_id_accessors "${role}")" || {
+    error "Could not list the SecretIDs of '${role}'; the token needs list on auth/approle/role/${role}/secret-id."
+    exit 1
+  }
+  if ! printf '%s\n' "${current}" | grep -qxF -- "${keep}"; then
+    error "Accessor ${keep} is not a SecretID of '${role}'; nothing was destroyed."
+    exit 1
+  fi
+  while IFS= read -r accessor; do
+    [[ -n "${accessor}" && "${accessor}" != "${keep}" ]] && doomed+=("${accessor}")
+  done <<< "${current}"
+  if [[ ${#doomed[@]} -eq 0 ]]; then
+    info "Role '${role}' has only the kept SecretID; nothing to destroy."
+    return 0
+  fi
+  info "Role '${role}': keep ${keep}, destroy ${#doomed[@]}:"
+  for accessor in "${doomed[@]}"; do echo "    ${accessor}"; done
+  if [[ "${OPT_YES}" != 1 ]]; then
+    confirm "Destroy these SecretIDs? Apps still using them lose access." || { warn "Aborted; nothing was destroyed."; return 0; }
+  fi
+  for accessor in "${doomed[@]}"; do
+    if bao write "auth/approle/role/${role}/secret-id-accessor/destroy" "secret_id_accessor=${accessor}" &>/dev/null; then
+      success "Destroyed ${accessor}"
+    else
+      error "Could not destroy ${accessor}"
+      failed=$((failed + 1))
+    fi
+  done
+  if [[ "${failed}" != 0 ]]; then
+    error "${failed} SecretID(s) of '${role}' could not be destroyed; rerun to retry."
+    exit 1
+  fi
 }
 
 # ─── SETUP ─────────────────────────────────────────────────
@@ -1108,6 +1344,14 @@ case "$CMD" in
   locked-users)
     require_server
     cmd_locked_users
+    ;;
+  rotate-secret-id)
+    require_server
+    cmd_rotate_secret_id "$@"
+    ;;
+  prune-secret-ids)
+    require_server
+    cmd_prune_secret_ids "$@"
     ;;
   help|--help|-h)
     show_help

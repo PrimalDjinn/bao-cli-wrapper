@@ -19,6 +19,8 @@ It needs Bash and the `bao` CLI on `PATH`.
 | `check-approle [--ttl 15m] [--read PATH]... [--secret-id-file FILE]` | Log in with an AppRole, read, then revoke the token. |
 | `unlock-role <app> <env>` or `unlock-role --role NAME` | Unlock an AppRole locked out by repeated failed logins. |
 | `locked-users` | List the AppRoles that are locked out, by name. |
+| `rotate-secret-id <app> <env>` or `--role NAME` `[--credentials-dir DIR]` | Issue and verify a new SecretID for an existing AppRole; old ones keep working. |
+| `prune-secret-ids <app> <env>` or `--role NAME` `--keep ACCESSOR [--yes]` | Destroy all of a role's SecretIDs except one. |
 | `help` | Show usage. |
 
 ```sh
@@ -192,6 +194,44 @@ documentation.
 Applications must back off when a login is rejected: stop or wait (exponential backoff with a
 long cap, well beyond the 15-minute lock) instead of retrying on a short timer, and never retry
 the same rejected secret in a loop.
+
+## Rotating a SecretID
+
+`rotate-secret-id` issues a new SecretID for an existing AppRole without touching anything
+else: the role's settings, policies and RoleID stay as they are, and existing SecretIDs keep
+working. Name the role like `unlock-role` does: `<app> <env>` means `<app>-<env>-backend`;
+`--role <name>` takes any AppRole. Rotation takes two steps, so the app never loses access:
+
+```sh
+# 1. Issue, verify with one login (its token is revoked at once) and deliver:
+./bao-setup-vault.sh rotate-secret-id heylomeet production
+./bao-setup-vault.sh rotate-secret-id --role qrs-staging-ops --credentials-dir ~/secure/rotation-2026-11-17
+
+# 2. After the app runs with the new SecretID, destroy all the role's other SecretIDs:
+./bao-setup-vault.sh prune-secret-ids heylomeet production --keep <new accessor>
+```
+
+Without `--credentials-dir`, the RoleID and the new SecretID are printed once as
+`export BAO_ROLE_ID=…` and `export BAO_SECRET_ID=…`, like `setup`. With it, `<role>.json`
+(`role`, `role_id`, `secret_id`, `accessor`) is written to an owner-only directory outside Git
+and no secret is printed; an existing file is never replaced, so use a new directory for each
+rotation. Bind `role_id` and `secret_id`. The **accessor** only identifies the SecretID for
+`prune-secret-ids`: it is not a credential and never goes into an app's configuration. The
+output also shows the SecretID's expiry, how many earlier SecretIDs are still valid and the
+exact prune command. The SecretID reaches the login over stdin, not the command line.
+
+A new SecretID that fails its verification login is destroyed again and never shown; the
+earlier ones are unchanged. A locked role is unlocked first, as in `setup` ([Lockout](#lockout)).
+
+`prune-secret-ids` lists the accessors it will destroy and asks once (`--yes` skips the
+question). It refuses an accessor to keep that the role does not have, so a typo destroys
+nothing. Any app still using a destroyed SecretID can no longer log in, and its retries then
+lock the role: update every consumer before pruning.
+
+The admin token needs `read` on `auth/approle/role/<role>/role-id`, `list` on
+`auth/approle/role/<role>/secret-id`, `update` on `auth/approle/role/<role>/secret-id` and
+`auth/approle/role/<role>/secret-id-accessor/destroy`, plus the lockout permissions above.
+Tokens need no rotation: each login issues a fresh short-lived token.
 
 ## Tests
 

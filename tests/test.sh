@@ -358,6 +358,93 @@ new_case; EXTRA_ENV=(); run_script "" unlock-role --role '../sys'
 check "unlock-role rejects a role name that could change the API path" "$([[ $rc -ne 0 ]] && output_has 'Role names may only contain' && ! has_call 'ARGS=read -field' && echo 0 || echo 1)"
 EXTRA_ENV=()
 
+# --- rotate-secret-id / prune-secret-ids -----------------------------------------
+old_secret() { echo accessor-old > "$FAKE_BAO_DIR/accessors"; }
+accessors() { paste -sd' ' "$FAKE_BAO_DIR/accessors" 2>/dev/null; }
+login_payload_has() { grep -q -- "$1" "$FAKE_BAO_DIR/login.stdin" 2>/dev/null; }
+
+new_case; old_secret; EXTRA_ENV=(); run_script "" rotate-secret-id demo staging
+check "rotate-secret-id <app> <env> issues, verifies and prints both values once, keeping the old SecretID" \
+  "$([[ $rc -eq 0 ]] && has_call 'ARGS=write -format=json -f auth/approle/role/demo-staging-backend/secret-id' \
+    && login_payload_has '"secret_id":"new-secret-id-sentinel"' && has_call 'TOKEN=login-token-sentinel .*ARGS=token revoke -self' \
+    && output_has 'export BAO_ROLE_ID=role-id-value' && output_has 'export BAO_SECRET_ID=new-secret-id-sentinel' \
+    && [[ $(grep -c new-secret-id-sentinel "$out") -eq 1 ]] && [[ "$(accessors)" == "accessor-old accessor-new-2" ]] \
+    && output_has 'not a credential, never bind it' && output_has '1 SecretID(s) still valid' \
+    && output_has 'prune-secret-ids demo staging --keep accessor-new-2' && echo 0 || echo 1)"
+check "the new SecretID never appears in a command line" "$(! calls | grep -q 'new-secret-id-sentinel' && echo 0 || echo 1)"
+
+new_case; EXTRA_ENV=(); run_script "" rotate-secret-id --role other-role
+check "rotate-secret-id --role works for a role with no SecretIDs yet" \
+  "$([[ $rc -eq 0 ]] && output_has '0 SecretID(s) still valid' && output_has 'export BAO_ROLE_ID=other-role-id' \
+    && output_has 'prune-secret-ids --role other-role --keep accessor-new-1' && echo 0 || echo 1)"
+
+new_case; old_secret; outdir="$(mktemp -d)/rotation"; EXTRA_ENV=(); run_script "" rotate-secret-id demo staging --credentials-dir "$outdir"
+file="$outdir/demo-staging-backend.json"
+check "--credentials-dir writes role_id, secret_id and accessor to a private file and prints no secret" \
+  "$([[ $rc -eq 0 && -f $file ]] && [[ $(stat -c %a "$file") == 600 && $(stat -c %a "$outdir") == 700 ]] \
+    && grep -q '"role_id":"role-id-value","secret_id":"new-secret-id-sentinel","accessor":"accessor-new-2"' "$file" \
+    && ! output_has 'new-secret-id-sentinel' && ! output_has 'export BAO_SECRET_ID' && output_has 'Bind role_id and secret_id' && echo 0 || echo 1)"
+: > "$FAKE_BAO_DIR/calls.log"; run_script "" rotate-secret-id demo staging --credentials-dir "$outdir"
+check "an existing credential file is never replaced and nothing is issued" \
+  "$([[ $rc -ne 0 ]] && output_has 'already exists' && ! has_call 'secret-id' && echo 0 || echo 1)"
+
+new_case; EXTRA_ENV=(); run_script "" rotate-secret-id demo staging --credentials-dir "$ROOT/rotation-output"
+check "--credentials-dir refuses a directory inside a Git work tree" \
+  "$([[ $rc -ne 0 ]] && output_has 'outside Git' && [[ ! -e $ROOT/rotation-output ]] && ! has_call 'ARGS=write' && echo 0 || echo 1)"
+
+new_case; open="$(mktemp -d)"; chmod 755 "$open"; EXTRA_ENV=(); run_script "" rotate-secret-id demo staging --credentials-dir "$open"
+check "--credentials-dir refuses a directory others can read" "$([[ $rc -ne 0 ]] && output_has 'chmod 700' && ! has_call 'ARGS=write' && echo 0 || echo 1)"
+
+new_case; old_secret; EXTRA_ENV=(FAKE_LOGIN_FAIL=1); run_script "" rotate-secret-id demo staging
+check "a new SecretID that fails its login is destroyed and never shown" \
+  "$([[ $rc -ne 0 ]] && output_has 'rejected at login; it was destroyed' && ! output_has 'new-secret-id-sentinel' \
+    && [[ "$(accessors)" == "accessor-old" ]] && echo 0 || echo 1)"
+
+new_case; old_secret; EXTRA_ENV=(FAKE_LOCKED=1); run_script "" rotate-secret-id demo staging
+check "rotate-secret-id unlocks a locked role before verifying" \
+  "$([[ $rc -eq 0 ]] && [[ $(call_index 'ARGS=write -f sys/locked-users') -lt $(login_index) ]] && output_has 'Update the app with the new secret promptly' && echo 0 || echo 1)"
+
+new_case; EXTRA_ENV=(); run_script "" rotate-secret-id demo missing-role
+check "rotate-secret-id of a missing role issues nothing" \
+  "$([[ $rc -ne 0 ]] && output_has "Could not read the role ID of 'demo-missing-role-backend'" && ! has_call 'ARGS=write' && echo 0 || echo 1)"
+
+new_case; EXTRA_ENV=(FAKE_LIST_FAIL=1); run_script "" rotate-secret-id demo staging
+check "rotate-secret-id stops when the SecretIDs cannot be listed" "$([[ $rc -ne 0 ]] && output_has 'Could not list' && ! has_call 'ARGS=write' && echo 0 || echo 1)"
+
+for args in "demo ../sys" "demo" "--role a/b" "--role x demo staging" "" "demo staging --keep x"; do
+  new_case; EXTRA_ENV=(); read -r -a argv <<< "$args"
+  run_script "" rotate-secret-id "${argv[@]+"${argv[@]}"}"
+  check "rotate-secret-id rejects '${args}' before calling the server" "$([[ $rc -ne 0 ]] && ! has_call 'ARGS=read -field' && ! has_call 'ARGS=write' && echo 0 || echo 1)"
+done
+
+new_case; old_secret; EXTRA_ENV=(); run_script "" rotate-secret-id demo staging; run_script "y\n" prune-secret-ids demo staging --keep accessor-new-2
+check "prune-secret-ids destroys every other SecretID after confirmation" \
+  "$([[ $rc -eq 0 ]] && output_has 'destroy 1' && output_has 'Destroyed accessor-old' && [[ "$(accessors)" == "accessor-new-2" ]] && echo 0 || echo 1)"
+run_script "" prune-secret-ids demo staging --keep accessor-new-2
+check "prune-secret-ids with only the kept SecretID does nothing" "$([[ $rc -eq 0 ]] && output_has 'nothing to destroy' && echo 0 || echo 1)"
+
+new_case; old_secret; EXTRA_ENV=(); run_script "" rotate-secret-id demo staging; run_script "n\n" prune-secret-ids demo staging --keep accessor-new-2
+check "prune-secret-ids aborts without confirmation" "$(output_has 'nothing was destroyed' && [[ "$(accessors)" == "accessor-old accessor-new-2" ]] && echo 0 || echo 1)"
+run_script "" prune-secret-ids --role demo-staging-backend --keep accessor-new-2 --yes
+check "prune-secret-ids --role --yes destroys without asking" "$([[ $rc -eq 0 ]] && [[ "$(accessors)" == "accessor-new-2" ]] && echo 0 || echo 1)"
+
+new_case; old_secret; EXTRA_ENV=(); run_script "" prune-secret-ids demo staging --keep accessor-typo --yes
+check "prune-secret-ids refuses an accessor the role does not have" \
+  "$([[ $rc -ne 0 ]] && output_has 'nothing was destroyed' && ! has_call 'destroy' && [[ "$(accessors)" == "accessor-old" ]] && echo 0 || echo 1)"
+
+new_case; old_secret; echo accessor-new >> "$FAKE_BAO_DIR/accessors"; EXTRA_ENV=(FAKE_DESTROY_FAIL=1); run_script "" prune-secret-ids demo staging --keep accessor-new --yes
+check "prune-secret-ids reports failed destroys" "$([[ $rc -ne 0 ]] && output_has 'could not be destroyed; rerun to retry' && echo 0 || echo 1)"
+
+for args in "demo staging" "demo staging --keep" "demo staging --keep a/b" "--role x demo staging --keep a"; do
+  new_case; EXTRA_ENV=(); read -r -a argv <<< "$args"
+  run_script "" prune-secret-ids "${argv[@]}"
+  check "prune-secret-ids rejects '${args}' before calling the server" "$([[ $rc -ne 0 ]] && ! has_call 'ARGS=read -field' && ! has_call 'ARGS=list' && echo 0 || echo 1)"
+done
+EXTRA_ENV=()
+
+new_case; run_script "" help
+check "help documents SecretID rotation" "$(output_has 'rotate-secret-id' && output_has 'prune-secret-ids' && output_has '\-\-keep' && echo 0 || echo 1)"
+
 # --- no silent localhost fallback ----------------------------------------------
 new_case; copy="$FAKE_BAO_DIR/copy"; mkdir -p "$copy"; cp "$ROOT/bao-setup-vault.sh" "$copy/"
 env -i HOME="$FAKE_BAO_DIR" PATH="$FAKE_BAO_DIR/bin:/usr/bin:/bin" FAKE_BAO_DIR="$FAKE_BAO_DIR" \
